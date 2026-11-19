@@ -26,11 +26,11 @@ namespace HNwd::detail {
 //
 //   53 grupp     [str namn][ptr 52][i32 flags][i32 X][i32 Y] Y × ATTR [i32 c] c × BARN
 //   22 löv       som 53, utan c och barn
-//   32 partition toppnod i en fil med flera modeller:
+//   32 partition en modell i en fil med flera:
 //              [i32 0] och sedan en kropp som klass 53 har, med modellens träd som
-//              barn, och sist en svans (PartitionTail i partition.h). Får bara stå
-//              som toppnod; svansen skapar nya objekt av klass 27 och 185, som tar
-//              id:n i trädets ström
+//              barn, och sist en svans (PartitionTail i partition.h). Står som
+//              toppnod eller som barn till en nod av klass 32. Svansen skapar
+//              nya objekt av klass 27 och 185, som tar id:n i trädets ström
 //   52 namnpar   [str visningsnamn][str internt namn]
 //   86 flik      [str namn][ptr 52][i32 flags][i32 n] n × ( [ptr 52 nyckel][i32 typ][värde] )
 //   66 element-id [str null][ptr 52 nyckel][i32 flags] PAD8 [i64 värde i 1 .. 2^31-1]
@@ -341,8 +341,8 @@ struct Hierarchy {
 //
 // CorruptObject: brott mot reglerna ovan. CorruptLink: rötterna och
 // null-platserna går inte ihop, eller antalet strömmar är inte k.
-// Unsupported: en nod av klass 32 på annat ställe än som toppnod (till exempel
-// som mål för en länk); `detail` anger byten där dess pekare står.
+// Unsupported: en nod av klass 32 på annat ställe än som toppnod eller under en
+// nod av klass 32 (till exempel som mål för en länk); `detail` anger byten där dess pekare står.
 // LimitExceeded: fler än `max_nodes` expanderade noder, eller ett träd högre
 // än kMaxNesting; en nod med fler än 2^32 - 1 expanderade noder under sig;
 // strängar över 4 GB eller placeringar över 8 GB.
@@ -501,7 +501,7 @@ struct HierarchySkeleton {
 };
 
 // Ungefär så mycket uppackad data mellan två kontrollpunkter.
-inline constexpr uint64_t kCheckpointEvery = uint64_t(4) << 20;
+inline constexpr uint64_t kCheckpointEvery = uint64_t(1) << 20;
 
 // Förloppet: `done` av `total` komprimerade byte. false avbryter.
 using HierarchyProgress = std::function<bool(uint64_t done, uint64_t total)>;
@@ -533,6 +533,21 @@ struct NodeTabs {
     std::vector<StoredName> names;
     std::vector<StoredProperty> properties;
     std::vector<StoredTab> tabs;   // nodens flikar i attributordning
+
+    // Byte som listorna håller, räknat ur kapaciteten.
+    size_t memory_bytes() const;
+};
+
+// Tolkade flikar ur trädets ström som flera noder delar, hos den som läser om
+// noder. En flik lämnas som en NodeTabs med exakt en flik.
+class SharedTabCache {
+public:
+    virtual ~SharedTabCache() = default;
+    // Fliken med id `id` i trädets ström, eller nullptr. Pekaren gäller till
+    // nästa anrop på cachen.
+    virtual const NodeTabs* find_tab(int32_t id) = 0;
+    // Fliken med id `id`. Cachen får låta bli att behålla den.
+    virtual void keep_tab(int32_t id, NodeTabs&& tab) = 0;
 };
 
 // Det parse_node_tabs() läser genom: läsare som står mitt i en av trädets
@@ -553,7 +568,11 @@ public:
 // `skeleton` är resultatet av parse_hierarchy() i läget Structure. `out`
 // ersätts. Felen som parse_hierarchy(); CorruptLink om skelettet inte stämmer
 // med strömmen, OutOfRange om noden inte finns.
+//
+// Med `cache` tas flikar som flera noder delar ur den i stället för ur
+// strömmen, och de som läses läggs i den.
 ErrorCode parse_node_tabs(const Hierarchy& h, const HierarchySkeleton& skeleton, uint32_t node,
-                          ObjectSource& source, NodeTabs& out, std::string* detail = nullptr);
+                          ObjectSource& source, NodeTabs& out, std::string* detail = nullptr,
+                          SharedTabCache* cache = nullptr);
 
 } // namespace HNwd::detail

@@ -126,7 +126,10 @@ struct ViewerOptions {
     uint64_t tile_triangles = 131'072;   // största bit i trianglar
     double min_pixels = 3;               // garantin: allt som är minst så här stort i bild syns
     bool profile = false;
-    bool tour = false;                   // --png: zooma in och ut före bilden
+    // --pacing: bildtakten. < 0 = varje bild ritas hel (förvalet), 0 =
+    // skärmens, > 0 = så många bilder per sekund.
+    double pacing_fps = -1;
+    bool tour = false;                  // --png: zooma in och ut före bilden
     double spin = 0;                     // --png: så många orbitvarv före bilden, 10 s per varv
     UvMode uv = UvMode::RealWorld;
     std::string view;                    // en sparad vy att starta i; tom: filens aktuella vy

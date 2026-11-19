@@ -87,7 +87,7 @@ bool PropertyReader::is_open() const { return impl_ && impl_->tree != nullptr; }
 
 const char* PropertyReader::last_error() const { return impl_ ? impl_->last_error.c_str() : ""; }
 
-Status PropertyReader::open(const Document& doc) try {
+Status PropertyReader::open(const Document& doc, size_t cache_bytes) try {
     Impl& s = ensure(impl_);
     s = Impl{};
     const Document::Impl* d = doc.impl_.get();
@@ -98,9 +98,11 @@ Status PropertyReader::open(const Document& doc) try {
         return s.fail(Status::NotLoaded, "the document's tree has not been loaded: call load_tree()");
     s.file = d->file;
     s.tree = published->shared_from_this();
+    // Med Structure läses flikarna ur filen; `cache_bytes` är taket för det
+    // läsaren behåller mellan anropen (0: ingenting).
     if (s.tree->content == TreeContent::Structure)
         s.tabs = std::make_unique<detail::TabReader>(s.file->data(), s.file->size(), s.tree->streams,
-                                                     s.tree->hierarchy, s.tree->skeleton);
+                                                     s.tree->hierarchy, s.tree->skeleton, cache_bytes);
     return s.ok();
 } catch (const std::bad_alloc&) {
     Impl& s = ensure(impl_);
@@ -134,8 +136,11 @@ Status PropertyReader::read(uint32_t node, NodeProperties& out) try {
             [&](size_t j) -> const detail::StoredTab& { return h.tabs[h.node_tabs[begin + j]]; },
             out);
     } else {
+        // En nod med flera förekomster läses flera gånger i expanderad ordning:
+        // dess flikar sparas i läsarens cache.
+        const bool keep = stored < t.repeated.size() && t.repeated[stored];
         std::string why;
-        const detail::ErrorCode ec = s.tabs->read(stored, s.node_tabs, &why);
+        const detail::ErrorCode ec = s.tabs->read(stored, s.node_tabs, &why, keep);
         if (ec != detail::ErrorCode::Ok) return s.fail(ec, why);
         const detail::NodeTabs& nt = s.node_tabs;
         filled = fill(nt.strings, nt.names, nt.properties, nt.tabs.size(),

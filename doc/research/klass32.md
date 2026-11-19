@@ -15,8 +15,12 @@ nedan är prövat mot de tio exempelfilerna (nio `.nwc` och `Navisworks.nwd`) av
 - **Toppnoderna i `LcOpNwdLogicalHierarchy` i en `.nwd`**: en nod av klass 32 per
   inläst modell. En `.nwc` har en toppnod av klass 53.
 
-Klass 32 står bara som toppnod. En klass 32 som barn eller som mål för en länk är
-inte sedd.
+Klass 32 står som toppnod eller som barn till en nod av klass 32, i flera
+nivåer: en fil kan vara sammansatt av filer som själva är sammansatta. Varje
+sådan nod har sin egen svans, med egen enhetskod, inläsare och källsökväg, och
+koden kan skilja sig från den omslutandes. I exempelfilerna står klass 32 bara
+som toppnod. En klass 32 som barn till en annan klass eller som mål för en länk
+är inte sedd.
 
 ## Grammatiken
 
@@ -42,7 +46,7 @@ KLASS 27 := [i32 1] PTR(185) [i32 0] [3 × f64] [6 × f64] [3 × f64]
 
 - `HUVUD` är en klass-53-kropp utan barnlistan: namnet, namnparet (klass 52),
   flaggor, elementindex X och Y attribut. `c` och `BARN` finns bara i trädet; de
-  är som i en klass 53, och barnen är klass 22 eller 53.
+  är som i en klass 53, och barnen är klass 22, 53 eller 32.
 - **`PARTITION_STRÖM`:** attributen är nya objekt av klass 31
   (`[str][15 × f64]`), som i exempelfilerna. Strömmen saknar egenskapsrötter, så
   en tom attributplats kan inte lösas upp där. Strömmen slutar där svansen slutar.
@@ -129,8 +133,8 @@ samma värden.
   före första `f64` är heltal. Byten är de samma.
 - Attribut av annan klass än 31, och en tom attributplats, i den fristående
   strömmen.
-- Om en klass 32 kan ha andra barn än ett, eller stå någon annanstans än som
-  toppnod.
+- Om en klass 32 kan stå någon annanstans än som toppnod eller under en klass
+  32.
 - Om svansen har en annan form i filer från andra inläsare än de två i
   exempelfilerna.
 

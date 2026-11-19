@@ -3,6 +3,7 @@
 //
 //   nwdsynth <ut.nwd> --fragments N --records M --nodes K [--no-spatial]
 //            [--unit 0|1|2|3] [--seed S] [--sizes A:B] [--detail N]
+//            [--prop-streams K] [--shared-tabs M] [--common-tab] [--instances N]
 //
 // Filen följer helt ur fröet (förval 1) och skrivs strömmande, så att också
 // miljontals fragment, poster och noder går att skriva med lite minne. Vad
@@ -11,7 +12,11 @@
 // trädet, så att läsaren får bygga ett eget. --sizes A:B ger varje posts
 // diagonal log-likformigt mellan A och B meter (utan flaggan är posterna
 // 0,5 till 5 m långa), och --detail N upp till N segment i en posts strip
-// (förval 12).
+// (förval 12). --prop-streams K delar egenskapsrötterna på K strömmar
+// (förval 1). --shared-tabs M låter varje M:te löv äga en flik som de andra
+// pekar på (M är 0 eller minst 2; förval 0), och --common-tab ger löv 0 en
+// flik som alla andra löv pekar på. --instances N lägger efter trädet en
+// andra toppnod med N barn, var och ett en upprepning av en grupp med löv.
 
 #include <cerrno>
 #include <chrono>
@@ -28,7 +33,8 @@ namespace {
 
 constexpr const char* kUsage =
     "usage: nwdsynth <out.nwd> --fragments N --records M --nodes K [--no-spatial] "
-    "[--unit 0|1|2|3] [--seed S] [--sizes A:B] [--detail N]\n";
+    "[--unit 0|1|2|3] [--seed S] [--sizes A:B] [--detail N] [--prop-streams K] "
+    "[--shared-tabs M] [--common-tab] [--instances N]\n";
 
 bool parse_count(const std::string& text, uint64_t& out) {
     if (text.empty() || text[0] < '0' || text[0] > '9') return false;
@@ -77,6 +83,11 @@ int tool_run(const std::vector<std::string>& args) {
         } else if (a == "--detail" && value && parse_count(args[++i], v) && v >= 1 &&
                    v <= synth::kMaxSegments) {
             o.max_segments = static_cast<uint32_t>(v);
+        } else if (a == "--prop-streams" && value && parse_count(args[++i], o.prop_streams)) {
+        } else if (a == "--shared-tabs" && value && parse_count(args[++i], o.shared_tabs)) {
+        } else if (a == "--instances" && value && parse_count(args[++i], o.instances)) {
+        } else if (a == "--common-tab") {
+            o.common_tab = true;
         } else if (a == "--no-spatial") {
             o.spatial = false;
         } else if (!a.empty() && a[0] != '-' && path.empty()) {
@@ -118,6 +129,13 @@ int tool_run(const std::vector<std::string>& args) {
     std::printf("tree:        %" PRIu64 " nodes: %" PRIu64 " leaves, %" PRIu64 " groups (%" PRIu64
                 " empty); %" PRIu64 " property roots\n",
                 o.nodes, r.leaves, r.groups, r.empty_groups, r.property_roots);
+    std::printf("properties:  %" PRIu64 " streams", o.prop_streams);
+    if (o.shared_tabs > 0) std::printf("; one shared tab per %" PRIu64 " leaves", o.shared_tabs);
+    if (o.common_tab) std::printf("; a common tab owned by leaf 0");
+    std::printf("; %" PRIu64 " references to shared tabs\n", r.shared_tab_refs);
+    std::printf("expanded:    %" PRIu64 " nodes", r.expanded_nodes);
+    if (o.instances > 0) std::printf(", with %" PRIu64 " repeated subtrees", o.instances);
+    std::printf("\n");
     std::printf("spatial:     %s\n", o.spatial ? "written" : "left out");
     std::printf("packages:\n");
     for (const synth::PackageInfo& p : r.packages)

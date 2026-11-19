@@ -5,7 +5,7 @@
 Ett C++20-bibliotek som läser Navisworks-filer (`.nwd`, `.nwc`) utan
 Navisworks och utan beroenden. En publik header, `include/HNwd.h`.
 
-**Läge: tidig utveckling, version 0.1.0.** [TODO.md](TODO.md)
+**Läge: tidig utveckling, version 0.2.0.** [TODO.md](TODO.md)
 säger vad som återstår.
 
 ## Vad det läser
@@ -19,7 +19,8 @@ säger vad som återstår.
 - **Objektträdet** med namn, flikar och egenskaper: helt i minnet, eller som
   ett skelett där en nods egenskaper läses först när de behövs
   (`TreeContent::Structure` med `PropertyReader`).
-- **Modellerna** i en fil med flera, med källa, inläsare och längdenhet.
+- **Modellerna** i en fil med flera, också modeller i modeller, med källa,
+  inläsare och längdenhet, och modellen som en nod eller ett fragment hör till.
 - **Ett rumsligt träd** över fragmenten, med världslåda och antal primitiver
   per nod, för att välja vad som ska läsas efter detaljnivå: filens eget,
   eller ett som HNwd bygger.

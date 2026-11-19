@@ -18,8 +18,6 @@ Det som inte är avkodat i filformatet, och bibliotekets kända svagheter, står
 
 ## Minne och fart på stora filer
 
-- [ ] **Baklängesläsning av egenskaper** i skelettläget kostar millisekunder
-      per nod; i stigande ordning är den nära linjär.
 - [ ] **Visaren:** hur bildens skala, vridning och förskjutning läggs på
       UV-värdena är antaget, liksom vilken sida av ett snittplan som
       behålls; genomskinliga ytor sorteras inte; textens vridning används

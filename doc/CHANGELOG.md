@@ -2,6 +2,31 @@
 
 Det som är kvar att göra ligger i [TODO.md](../TODO.md).
 
+## 0.2.0
+
+- Modellerna på alla nivåer: `Document::model()` ger varje nod av klass 32 i
+  trädet, också dem som sitter i en annan modell, i preorder med
+  `Model::parent` och `Model::depth`. `model_of_node()` och
+  `model_of_fragment()` ger den innersta modellen. **För en fil med modeller i
+  modeller ändras antalet modeller och deras index**; en modells fragment är
+  hela delträdets. Filer utan sådana svarar som förut.
+- `PropertyReader` i `TreeContent::Structure` håller en cache med tak
+  (`open(doc, cache_bytes)`, förval 16 MiB) för flikar som flera noder delar
+  och för noder som sitter på flera ställen i trädet, så att de inte läses om
+  ur filen. Ett träd där nära hälften av förekomsterna är upprepningar läses
+  nod för nod tiotals gånger fortare.
+- Kontrollpunkterna i trädets strömmar står var 1 MiB i stället för var
+  4 MiB.
+- `nwdview` visar modellerna på översta nivån, som förut.
+- `nwdview --pacing vsync|all|N`: bildtakten. `all` ritar varje bild hel
+  (förvalet); med `vsync` eller ett antal bilder per sekund ritar ritytan det
+  som ryms i tiden under rörelse och fyller på resten i stillhet.
+- `nwdview` bygger på ramverkets version där ytor i samma plan har en fast
+  ordning i ritytan och bildtakten går att välja.
+- `nwdsynth --prop-streams`, `--shared-tabs`, `--common-tab` och
+  `--instances`: flera egenskapsströmmar, delade flikar och delträd på flera
+  ställen.
+
 ## 0.1.0
 
 - Mappstruktur och bygge: CMake med Ninja, modulen `HNwd::core`, paraplyet

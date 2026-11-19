@@ -28,9 +28,9 @@ namespace HNwd {
 // Bibliotekets version. Samma tal som project(VERSION) i CMakeLists.txt; de
 // två ändras tillsammans.
 inline constexpr int kVersionMajor = 0;
-inline constexpr int kVersionMinor = 1;
+inline constexpr int kVersionMinor = 2;
 inline constexpr int kVersionPatch = 0;
-inline constexpr const char* kVersionString = "0.1.0";
+inline constexpr const char* kVersionString = "0.2.0";
 
 // Inget index: ingen förälder, inget barn, inget syskon.
 inline constexpr uint32_t kNone = UINT32_MAX;
@@ -283,12 +283,18 @@ struct Model {
     std::string_view name;     // nodens namn, som Node::name; för en fil med en modell partitionens
     std::string_view source;   // källfilens sökväg som den står i filen; tom om den saknas
     std::string_view loader;   // inläsaren som gjorde modellen; tom om den saknas
-    // Längdenheten för modellens koordinater. En kod som inte är känd ger
-    // LengthUnit::Unknown och metres_per_unit 0, med koden i code.
+    // Längdenheten i modellens partition, med koden som den står där. En kod
+    // som inte är känd ger LengthUnit::Unknown och metres_per_unit 0, med
+    // koden i code. Om fragmentens poser i en modell som sitter i en annan
+    // redan är omräknade till den omslutande modellens enhet är inte belagt.
     Unit unit;
-    uint32_t node = 0;             // modellens nod: en toppnod, eller roten för en fil med en modell
-    uint32_t first_fragment = 0;   // modellens fragment ligger i följd
+    uint32_t node = 0;             // modellens nod: en nod av klass 32, eller roten för en fil med en modell
+    // Fragmenten i modellens delträd, de i modellerna under den inräknade; de
+    // ligger i följd.
+    uint32_t first_fragment = 0;
     uint32_t fragment_count = 0;
+    uint32_t parent = kNone;       // närmaste omslutande modell (index för model()); kNone på översta nivån
+    uint32_t depth = 0;            // antalet omslutande modeller; 0 på översta nivån
 };
 
 // En nods flikar och egenskaper, ur PropertyReader::read(). Egenskaperna
@@ -700,21 +706,33 @@ public:
     // ett index utanför. Gå uppåt med parent() för hela vägen.
     uint32_t node_of_fragment(size_t fragment) const;
 
-    // Modellerna i filen. En fil med flera inlästa modeller har en per
-    // toppnod av klass 32 (NodeKind::Partition), i trädets ordning, med namn,
-    // källa, inläsare och enhet ur nodens partition; en toppnod av en annan
-    // klass är ingen modell. En fil utan sådana toppnoder har en modell ur
-    // filens egen partition (Package::Partition) med roten som nod, och
-    // ingen modell om den saknar partitionen. Fragmenten i en modell är de
-    // vars seq ligger i modellens delträd.
+    // Modellerna i filen. En fil med flera inlästa modeller har en per nod
+    // av klass 32 (NodeKind::Partition) i trädet: toppnoderna av den klassen
+    // och de som sitter under dem, på alla nivåer. Modellerna ligger i
+    // preorder, en modell före dem som sitter i den, så Model::node växer med
+    // indexet. Namn, källa, inläsare och enhet kommer ur nodens egen
+    // partition. En nod av en annan klass är ingen modell. En fil utan noder
+    // av klass 32 i trädet har en modell ur filens egen partition
+    // (Package::Partition) med roten som nod, och ingen modell om den saknar
+    // partitionen. En modells fragment är de vars seq ligger i modellens
+    // delträd, de i modellerna under den inräknade; modellerna på översta
+    // nivån överlappar inte.
     //
     // Kräver load_tree() och load_fragments(), i vilken ordning som helst:
-    // model_count() är 0 och model() ger false innan båda är gjorda, och
-    // för ett index utanför. Inget av dem läser något mer.
-    // Partitionen läses av load_tree(); går den inte att tolka ger
+    // model_count() är 0, model() ger false och model_of_node() och
+    // model_of_fragment() ger kNone innan båda är gjorda. Inget av dem läser
+    // något mer. Partitionen läses av load_tree(); går den inte att tolka ger
     // load_tree() felet.
     size_t model_count() const;
     bool model(size_t i, Model& out) const;
+    // Den innersta modellen vars delträd har noden (index för model()). En
+    // modells egen nod hör till modellen. kNone när ingen modell har noden,
+    // och för ett index utanför.
+    uint32_t model_of_node(uint32_t node) const;
+    // Den innersta modellen som har fragmentets nod (node_of_fragment()), ur
+    // ett och samma träd. kNone när ingen modell har den, och för ett index
+    // utanför.
+    uint32_t model_of_fragment(size_t fragment) const;
 
     // Vyerna: den aktuella vyn (LcOpCurrentViewElement), hemvyn
     // (LcOpHomeViewElement) och de sparade vyerna (LcOpSavedViewsElement).
@@ -826,7 +844,11 @@ private:
 // Med TreeContent::Full kommer flikarna ur dokumentets minne. Med Structure
 // läses de ur filen: trädets ström packas upp från närmaste kontrollpunkt
 // före noden, eller vidare från där läsaren stod, så noder i stigande
-// ordning är billigast. Resultatet är detsamma i båda.
+// ordning är billigast. Flikar som flera noder delar, och flikarna för noder
+// som sitter på flera ställen i trädet, hålls i en cache med taket
+// `cache_bytes`, så att de inte läses om. Därutöver håller läsaren nio
+// uppackningar med en buffert på 288 KB var. Resultatet är detsamma i båda
+// lägena och med vilket tak som helst.
 class PropertyReader {
 public:
     PropertyReader();
@@ -837,7 +859,8 @@ public:
     PropertyReader& operator=(const PropertyReader&) = delete;
 
     // Kräver load_tree() på dokumentet, med vilket innehåll som helst.
-    Status open(const Document& doc);
+    // `cache_bytes` är cachens tak i TreeContent::Structure; 0 stänger av den.
+    Status open(const Document& doc, size_t cache_bytes = size_t(16) << 20);
     void close();
     bool is_open() const;
 

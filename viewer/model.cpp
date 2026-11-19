@@ -381,8 +381,12 @@ TreeResult load_tree(const Model& model, const LoadProgress& progress) {
     for (size_t i = 0; i < doc.model_count(); ++i) {
         HNwd::Model hm;
         if (!doc.model(i, hm)) continue;
+        // Listan, filtret och klicket räknar med modellerna på översta nivån:
+        // en nästlad modells fragment ligger i förälderns intervall.
+        if (hm.parent != HNwd::kNone) continue;
         ModelInfo info;
-        info.name = hm.name.empty() ? "modell " + std::to_string(i + 1) : std::string(hm.name);
+        info.name = hm.name.empty() ? "modell " + std::to_string(r.models.size() + 1)
+                                    : std::string(hm.name);
         info.unit_text = unit_text(hm.unit, hm.unit.unit == HNwd::LengthUnit::Unknown
                                                 ? HNwd::Status::Unsupported
                                                 : HNwd::Status::Ok,

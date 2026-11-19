@@ -351,6 +351,81 @@ std::string props_what(size_t stream) {
     return "LcOaPartitionProps stream " + std::to_string(stream);
 }
 
+// Kopierar en flik med sina egenskaper mellan två uppsättningar strängar,
+// namnpar och egenskaper. Strängarna går genom målets pool och namnparen
+// numreras om i målet, ett per namnpar i källan. Null (kNone) förblir kNone,
+// så att en null-sträng aldrig blir en tom, och ett värde som inte bär text
+// kopieras som det är.
+class TabCopier {
+public:
+    TabCopier(const StringPool& from_strings, const std::vector<StoredName>& from_names,
+              const std::vector<StoredProperty>& from_props, StringPool& to_strings,
+              std::vector<StoredName>& to_names, std::vector<StoredProperty>& to_props)
+        : from_strings_(from_strings), from_names_(from_names), from_props_(from_props),
+          to_strings_(to_strings), to_names_(to_names), to_props_(to_props) {}
+
+    // `out` blir fliken i målet; dess egenskaper hamnar sist i målets lista.
+    // LimitExceeded om poolen eller listorna inte rymmer mer, CorruptObject om
+    // fliken pekar utanför sina listor.
+    ErrorCode copy(const StoredTab& t, StoredTab& out) {
+        if (t.prop_begin > from_props_.size() || t.prop_count > from_props_.size() - t.prop_begin)
+            return ErrorCode::CorruptObject;
+        if (to_props_.size() > UINT32_MAX - t.prop_count) return ErrorCode::LimitExceeded;
+        out = t;
+        ErrorCode e = copy_string(t.name, out.name);
+        if (e == ErrorCode::Ok) e = copy_name(t.user, out.user);
+        out.prop_begin = static_cast<uint32_t>(to_props_.size());
+        for (uint32_t k = 0; e == ErrorCode::Ok && k < t.prop_count; ++k) {
+            StoredProperty q = from_props_[t.prop_begin + k];
+            e = copy_name(q.key, q.key);
+            if (e == ErrorCode::Ok && (q.type == 4 || q.type == 9)) e = copy_string(q.text, q.text);
+            if (e == ErrorCode::Ok && q.type == 8) e = copy_name(q.text, q.text);
+            if (e == ErrorCode::Ok) to_props_.push_back(q);
+        }
+        return e;
+    }
+
+private:
+    ErrorCode copy_string(uint32_t from, uint32_t& to) {
+        if (from == kNone) {
+            to = kNone;
+            return ErrorCode::Ok;
+        }
+        if (from >= from_strings_.count()) return ErrorCode::CorruptObject;
+        return to_strings_.add(from_strings_.get(from), to) ? ErrorCode::Ok : ErrorCode::LimitExceeded;
+    }
+
+    ErrorCode copy_name(uint32_t from, uint32_t& to) {
+        if (from == kNone) {
+            to = kNone;
+            return ErrorCode::Ok;
+        }
+        const auto found = renumbered_.find(from);
+        if (found != renumbered_.end()) {
+            to = found->second;
+            return ErrorCode::Ok;
+        }
+        if (from >= from_names_.size()) return ErrorCode::CorruptObject;
+        if (to_names_.size() >= kNone - 1) return ErrorCode::LimitExceeded;
+        StoredName n;
+        ErrorCode e = copy_string(from_names_[from].display, n.display);
+        if (e == ErrorCode::Ok) e = copy_string(from_names_[from].internal, n.internal);
+        if (e != ErrorCode::Ok) return e;
+        to = static_cast<uint32_t>(to_names_.size());
+        to_names_.push_back(n);
+        renumbered_.emplace(from, to);
+        return ErrorCode::Ok;
+    }
+
+    const StringPool& from_strings_;
+    const std::vector<StoredName>& from_names_;
+    const std::vector<StoredProperty>& from_props_;
+    StringPool& to_strings_;
+    std::vector<StoredName>& to_names_;
+    std::vector<StoredProperty>& to_props_;
+    std::unordered_map<uint32_t, uint32_t> renumbered_;   // namnpar i källan -> i målet
+};
+
 enum class Mode : uint8_t {
     Full,        // allt lagras
     Structure,   // noderna och namnparen lagras, flikarna läses förbi
@@ -441,12 +516,14 @@ public:
     }
 
     // En lagrad nods attribut, läsa om ur `source`. Flikarna hamnar i h_ och
-    // deras ordning i region_tabs().
+    // deras ordning i region_tabs(). Med `cache` tas delade flikar ur den, och
+    // de som läses läggs i den.
     ErrorCode run_region(const Hierarchy& src, const HierarchySkeleton& sk, uint32_t node,
-                         ObjectSource& source, std::string& detail) {
+                         ObjectSource& source, std::string& detail, SharedTabCache* cache) {
         src_ = &src;
         sk_ = &sk;
         source_ = &source;
+        tab_cache_ = cache;
         NodeLocation loc;
         if (!sk.location(node, loc)) {
             detail = std::string(kWhat) + ": the skeleton has no location for node " + std::to_string(node);
@@ -590,6 +667,11 @@ private:
         uint32_t value = 0;
         if (!body(r, p.cls, value) || !r.finish(p.id, value)) return Slot::Failed;
         p.value = value;
+        // En flik ur trädets ström som andra noder pekar bakåt på, nu färdigtolkad.
+        // Rötterna i egenskapsströmmarna har id ur en annan ström och hör inte hit.
+        if (tab_cache_ && mode_ == Mode::Region && &r != props_reader_ && is_tab_class(p.cls) &&
+            shared_tab(p.id))
+            keep_shared(p.id, value);
         return Slot::Done;
     }
 
@@ -1524,9 +1606,65 @@ private:
         return true;
     }
 
+    static bool is_tab_class(int32_t cls) { return cls == 86 || cls == 66 || cls == 70 || cls == 76; }
+
+    // Sann om en nod före området pekar bakåt på fliken med id `id` i trädets
+    // ström: skelettets lista över bakåtpekare har den, och den är en flik.
+    bool shared_tab(int32_t id) const {
+        int32_t cls = 0;
+        uint32_t value = 0;
+        return sk_->refs.find(0, id, cls, value) && is_tab_class(cls);
+    }
+
+    // Fliken `local` i h_, med sina egenskaper, som en NodeTabs med exakt en
+    // flik. Strängarna och namnparen är bara de fliken använder, och listorna
+    // krymps till sitt innehåll. false om fliken inte går att kopiera.
+    bool copy_out(uint32_t local, NodeTabs& out) {
+        if (local >= h_.tabs.size()) return false;
+        NodeTabs n;
+        TabCopier copier(h_.strings, h_.names, h_.properties, n.strings, n.names, n.properties);
+        StoredTab t;
+        if (copier.copy(h_.tabs[local], t) != ErrorCode::Ok) return false;
+        n.tabs.push_back(t);
+        n.strings.shrink_to_fit();
+        n.names.shrink_to_fit();
+        n.properties.shrink_to_fit();
+        n.tabs.shrink_to_fit();
+        out = std::move(n);
+        return true;
+    }
+
+    // Fliken i `from` (en NodeTabs med exakt en flik) sist i h_; `local` blir
+    // dess index i h_.tabs.
+    bool copy_in(const NodeTabs& from, uint32_t& local) {
+        if (from.tabs.size() != 1)
+            return err(ErrorCode::CorruptObject, "internal error: a cached tab is not a single tab");
+        if (h_.tabs.size() >= kNone - 1)
+            return err(ErrorCode::LimitExceeded, "more tabs than an index can address");
+        TabCopier copier(from.strings, from.names, from.properties, h_.strings, h_.names,
+                         h_.properties);
+        StoredTab t;
+        const ErrorCode e = copier.copy(from.tabs[0], t);
+        if (e == ErrorCode::LimitExceeded)
+            return err(e, "the strings or properties of the tabs exceed what an index can address");
+        if (e != ErrorCode::Ok)
+            return err(e, "internal error: a cached tab does not match its own lists");
+        local = static_cast<uint32_t>(h_.tabs.size());
+        h_.tabs.push_back(t);
+        return true;
+    }
+
+    // Lägger fliken `local`, som läses ur trädets ström och som andra noder delar,
+    // i cachen under id `id`. En flik som inte går att kopiera lämnas utanför.
+    void keep_shared(int32_t id, uint32_t local) {
+        NodeTabs t;
+        if (copy_out(local, t)) tab_cache_->keep_tab(id, std::move(t));
+    }
+
     // Flikarna före området som nodens attribut pekar bakåt på, var och en läst
     // från sin egen position i trädets ström, i stigande position så att
-    // uppackningen bara går framåt. En flik som förekommer två gånger läses en gång.
+    // uppackningen bara går framåt, eller tagen ur cachen utan att strömmen
+    // öppnas. En flik som förekommer två gånger läses en gång.
     bool import_shared_tabs() {
         std::sort(shared_tabs_.begin(), shared_tabs_.end(),
                   [](const SharedTab& a, const SharedTab& b) { return a.pos < b.pos; });
@@ -1535,6 +1673,15 @@ private:
             if (k > 0 && shared_tabs_[k - 1].id == s.id) {
                 tab_stack_[s.index] = tab_stack_[shared_tabs_[k - 1].index];
                 continue;
+            }
+            if (tab_cache_) {
+                // Pekaren gäller bara till nästa anrop på cachen: fliken kopieras genast.
+                if (const NodeTabs* hit = tab_cache_->find_tab(s.id)) {
+                    uint32_t cached = 0;
+                    if (!copy_in(*hit, cached)) return false;
+                    tab_stack_[s.index] = cached;
+                    continue;
+                }
             }
             ErrorCode code = ErrorCode::Ok;
             std::string why;
@@ -1550,6 +1697,7 @@ private:
             }
             if (!ok) return fail_from(*r);
             tab_stack_[s.index] = local;
+            if (tab_cache_) keep_shared(s.id, local);
         }
         return true;
     }
@@ -1688,6 +1836,7 @@ private:
     size_t slot_at_ = 0;   // var den senaste pekarplatsen började
     uint32_t props_stream_ = 0;
     std::unordered_map<uint32_t, uint32_t> imported_names_;
+    SharedTabCache* tab_cache_ = nullptr;   // delade flikar ur och in i, eller nullptr
     // En flik före området som en attributplats pekar på: platsen i tab_stack_,
     // klassen, id och kroppens position.
     struct SharedTab {
@@ -1770,8 +1919,14 @@ ErrorCode parse_hierarchy(const uint8_t* file, size_t size, const HierarchyStrea
     return e;
 }
 
+size_t NodeTabs::memory_bytes() const {
+    return strings.memory_bytes() + names.capacity() * sizeof(StoredName) +
+           properties.capacity() * sizeof(StoredProperty) + tabs.capacity() * sizeof(StoredTab);
+}
+
 ErrorCode parse_node_tabs(const Hierarchy& h, const HierarchySkeleton& skeleton, uint32_t node,
-                          ObjectSource& source, NodeTabs& out, std::string* detail) {
+                          ObjectSource& source, NodeTabs& out, std::string* detail,
+                          SharedTabCache* cache) {
     out = NodeTabs{};
     if (detail) detail->clear();
     if (node >= h.nodes.size() || node >= skeleton.locations.size()) {
@@ -1785,7 +1940,7 @@ ErrorCode parse_node_tabs(const Hierarchy& h, const HierarchySkeleton& skeleton,
     Hierarchy scratch;
     std::string text;
     Parser parser(Mode::Region, scratch, UINT32_MAX, UINT64_MAX);
-    const ErrorCode e = parser.run_region(h, skeleton, node, source, text);
+    const ErrorCode e = parser.run_region(h, skeleton, node, source, text, cache);
     if (e != ErrorCode::Ok) {
         if (detail) *detail = text;
         return e;

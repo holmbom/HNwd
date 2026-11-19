@@ -12,9 +12,14 @@
 //                              upp till exakt 65536 byte, utom den sista
 //   LcOpNwdFragments           fragmenten i lövordning, med blandade poseklasser
 //   LcOpNwdLogicalHierarchy    ett träd av grupper (53) och löv (22) med
-//                              transformer (40, 41, 39) och en flik (86) per löv
-//   LcOaPartitionProps         (4, b) prefix 0: en ström med rötterna (86 och 66)
-//                              som lövens tomma attributplatser tar
+//                              transformer (40, 41, 39) och en flik (86) per löv;
+//                              med Options::shared_tabs och common_tab också
+//                              flikar som löven delar genom bakåtpekare, och
+//                              med Options::instances en andra toppnod vars
+//                              barn är bakåtpekare till grupper med löv
+//   LcOaPartitionProps         (4, b) prefix 0: Options::prop_streams strömmar
+//                              med rötterna (86 och 66) som lövens tomma
+//                              attributplatser tar, i följd
 //   LcOpGuidStore              ett GUID per löv
 //   LcOpNwdPartition           filens partition med enhetskoden
 //   LcOpNwdSpatialHierarchy    ett rumsligt träd över fragmenten (om det begärs)
@@ -61,6 +66,19 @@ struct Options {
     // varje posts diagonal är då log-likformigt fördelad mellan dem.
     double min_size = 0, max_size = 0;
     uint32_t max_segments = 12;   // stripens längsta längd: 1 till max_segments segment per post
+    // Antalet strömmar i LcOaPartitionProps: 1 till antalet rötter. Rötterna
+    // fördelas i följd, så lika många som möjligt i varje ström.
+    uint64_t prop_streams = 1;
+    // Varje m:te löv (löv 0, m, 2m, …) äger en ny flik med en egenskap, och de
+    // andra löven pekar bakåt på den senaste ägarens. 0 ger inga sådana flikar;
+    // 1 är inget val som går, eftersom då delar ingen något.
+    uint64_t shared_tabs = 0;
+    // Löv 0 äger en flik med en egenskap som varje annat löv pekar bakåt på.
+    bool common_tab = false;
+    // Antalet barn i en andra toppnod efter huvudträdet. Varje barn är en
+    // bakåtpekare till en grupp vars barn är löv, vald ur fröet; samma grupp kan
+    // väljas flera gånger. 0 ger ingen andra toppnod.
+    uint64_t instances = 0;
 };
 
 struct PackageInfo {
@@ -70,7 +88,13 @@ struct PackageInfo {
 
 struct Result {
     uint64_t file_bytes = 0;
-    uint64_t leaves = 0, groups = 0, empty_groups = 0;
+    uint64_t leaves = 0, groups = 0, empty_groups = 0;   // huvudträdet; toppnoden för instances ingår inte
+    // Noderna i det expanderade trädet med den underförstådda roten, som
+    // Document::node_count(): Options::nodes + 1, och med instances också den
+    // andra toppnoden och varje förekomst av en grupp med sina löv.
+    uint64_t expanded_nodes = 0;
+    // Attribut som pekar bakåt på en delad flik (shared_tabs och common_tab).
+    uint64_t shared_tab_refs = 0;
     uint64_t triangle_records = 0, line_records = 0;
     uint64_t chunks = 0;
     uint64_t geometry_bytes = 0;     // posterna uppackade
@@ -645,6 +669,12 @@ void name_pair(W& w, int32_t& id, const char* display, const char* internal) {
 // Löv med en tom attributplats, som tar en rot ur LcOaPartitionProps.
 inline bool leaf_has_root(uint64_t ordinal) { return ordinal % 4 == 0; }
 
+// En grupp vars barn alla är löv, som en andra toppnod kan peka bakåt på.
+struct LeafGroup {
+    int32_t id = 0;         // gruppens id i trädets ström
+    uint32_t leaves = 0;    // antalet löv under den
+};
+
 // Trädets ström.
 template <class W>
 struct TreeVisitor {
@@ -653,12 +683,21 @@ struct TreeVisitor {
     W& w;
     const Plan& p;
     int32_t group_pair = 0, leaf_pair = 0, tab_pair = 0, key_name = 0, key_number = 0, key_length = 0;
+    int32_t common_pair = 0, common_key = 0, shared_pair = 0, shared_key = 0;
+    int32_t common_id = 0, shared_id = 0;   // de delade flikarnas senaste ägare
     uint64_t groups = 0;
+    uint64_t shared_refs = 0;               // bakåtpekare till delade flikar
+    std::vector<LeafGroup> leaf_groups;     // bara med Options::instances
+    int32_t group_id = 0;                   // gruppen som skrevs senast
+    uint32_t group_depth = 0;
+    bool in_leaf_group = false;             // löven under group_id har börjat
+    int32_t leaf_group_id = 0;
+    uint32_t leaf_group_leaves = 0;
 
     void group(uint64_t seq, uint32_t depth, uint64_t children, const NodeTransform& t) {
-        (void)depth;
         ++groups;
-        w.obj(53);
+        group_id = w.obj(53);
+        group_depth = depth;
         w.str("Group " + std::to_string(seq));
         name_pair(w, group_pair, "Group", "LcOaNode");
         w.i32(0);
@@ -667,17 +706,89 @@ struct TreeVisitor {
         if (t.cls) write_transform(w, t);
         w.i32(static_cast<int32_t>(children));
     }
-    void group_end() {}
+    // En grupp med löv slutar här. Toppgruppen räknas inte med när den också har
+    // tomma grupper under sig: då är inte alla dess barn löv.
+    void group_end() {
+        if (!in_leaf_group) return;
+        leaf_groups.push_back({leaf_group_id, leaf_group_leaves});
+        in_leaf_group = false;
+    }
+
+    // En flik med en egenskap av typ 2 som lövet äger, med egna namnpar.
+    int32_t write_shared_tab(const char* name, int32_t& pair, const char* display, const char* internal,
+                             int32_t& key, const char* key_display, const char* key_internal,
+                             int32_t value) {
+        const int32_t id = w.obj(86);
+        w.str(name);
+        name_pair(w, pair, display, internal);
+        w.i32(0);
+        w.i32(1);
+        name_pair(w, key, key_display, key_internal);
+        w.i32(2);
+        w.i32(value);
+        return id;
+    }
+
+    // Den andra toppnoden: `count` barn, var och ett en bakåtpekare till en
+    // grupp med löv ur fröet. Ger antalet noder förekomsterna tillför i det
+    // expanderade trädet, toppnoden själv inräknad.
+    uint64_t write_instances(uint64_t count) {
+        w.obj(53);
+        w.str("Instances");
+        name_pair(w, group_pair, "Group", "LcOaNode");
+        w.i32(0);
+        w.i32(0);
+        w.i32(0);
+        w.i32(static_cast<int32_t>(count));
+        uint64_t added = 1;
+        for (uint64_t i = 0; i < count; ++i) {
+            const LeafGroup& g = leaf_groups[static_cast<size_t>(hash(p.o.seed, 40, i) % leaf_groups.size())];
+            w.ref(g.id);
+            added += 1 + g.leaves;
+        }
+        return added;
+    }
+
     void leaf(uint64_t seq, uint64_t ordinal, const NodeTransform& t) {
         (void)seq;
+        if (p.o.instances > 0 && (group_depth > 1 || p.empty_groups == 0)) {
+            if (!in_leaf_group) {
+                in_leaf_group = true;
+                leaf_group_id = group_id;
+                leaf_group_leaves = 0;
+            }
+            ++leaf_group_leaves;
+        }
         w.obj(22);
         w.str("Part " + std::to_string(ordinal));
         name_pair(w, leaf_pair, "Geometry", "LcOaGeometry");
         w.i32(0);
         w.i32(static_cast<int32_t>(ordinal + 1));   // elementet: GUID nummer ordinal
         const bool root = leaf_has_root(ordinal);
-        w.i32((t.cls ? 1 : 0) + 1 + (root ? 1 : 0));
+        const bool common = p.o.common_tab;
+        const bool grouped = p.o.shared_tabs != 0;
+        w.i32((t.cls ? 1 : 0) + (common ? 1 : 0) + (grouped ? 1 : 0) + 1 + (root ? 1 : 0));
         if (t.cls) write_transform(w, t);
+        // Den gemensamma fliken: löv 0 äger den, varje annat löv pekar på den.
+        if (common) {
+            if (ordinal == 0) {
+                common_id = write_shared_tab("Common", common_pair, "Common", "LcOaCommon", common_key,
+                                             "Revision", "LcOaRevision", 7);
+            } else {
+                w.ref(common_id);
+                ++shared_refs;
+            }
+        }
+        // Gruppfliken: vart m:te löv äger en ny, de andra pekar på den senaste.
+        if (grouped) {
+            if (ordinal % p.o.shared_tabs == 0) {
+                shared_id = write_shared_tab("Shared", shared_pair, "Shared", "LcOaShared", shared_key,
+                                             "Group", "LcOaGroup", static_cast<int32_t>(ordinal % 1000000));
+            } else {
+                w.ref(shared_id);
+                ++shared_refs;
+            }
+        }
         // En flik med tre egenskaper: text, heltal och flyttal.
         w.obj(86);
         w.str("Item");
@@ -915,6 +1026,25 @@ inline bool write(const std::string& path, const Options& o, Result& result, std
         result.empty_groups = p.empty_groups;
     }
 
+    // Valen som beror på trädets form.
+    const uint64_t roots = (p.leaves + 3) / 4;
+    if (o.prop_streams < 1 || o.prop_streams > roots) {
+        why = "prop_streams is not in 1.." + std::to_string(roots) + ", the number of property roots";
+        return false;
+    }
+    if (o.shared_tabs == 1) {
+        why = "shared_tabs is 1, which makes every leaf its own owner and shares nothing; use 0 or 2 and up";
+        return false;
+    }
+    if (o.instances > 0x7FFFFFF0) {
+        why = "instances is larger than a 32-bit child count in the file allows";
+        return false;
+    }
+    if (o.instances > 0 && p.leaves <= kGroupFanout && p.empty_groups > 0) {
+        why = "instances needs a group whose children are all leaves, and this tree has none";
+        return false;
+    }
+
     FileSink out;
     if (!out.open(path)) {
         why = "cannot open " + path + " for writing: " + std::strerror(out.open_errno());
@@ -995,18 +1125,21 @@ inline bool write(const std::string& path, const Options& o, Result& result, std
     }
 
     // Trädet.
-    const uint64_t roots = (p.leaves + 3) / 4;
     result.property_roots = roots;
+    result.expanded_nodes = o.nodes + 1;
     {
         const uint64_t offset = out.pos();
         StoredZlib z(out);
         Writer<StoredZlib> w(z);
-        w.i32(1);
-        w.i32(static_cast<int32_t>(roots));
+        w.i32(static_cast<int32_t>(o.prop_streams));
+        for (uint64_t s = 0; s < o.prop_streams; ++s)
+            w.i32(static_cast<int32_t>(roots / o.prop_streams + (s < roots % o.prop_streams ? 1 : 0)));
         w.implicit_root();
-        w.i32(1);   // en toppnod
+        w.i32(o.instances > 0 ? 2 : 1);   // toppnoderna
         TreeVisitor<Writer<StoredZlib>> v(w, p);
         walk(p, v);
+        if (o.instances > 0) result.expanded_nodes += v.write_instances(o.instances);
+        result.shared_tab_refs = v.shared_refs;
         w.i32(1);
         w.pad(8);
         z.finish();
@@ -1014,15 +1147,18 @@ inline bool write(const std::string& path, const Options& o, Result& result, std
     }
 
     // Egenskapsrötterna: varannan en flik med ett heltal, varannan ett element-id.
+    // Strömmarna delar dem i följd, med lika många som möjligt i var och en.
     {
         const uint64_t offset = out.pos();
         out.i32(0);
-        uint64_t stream_length = 0;
-        {
+        std::vector<int32_t> stream_lengths;
+        uint64_t j = 0;
+        for (uint64_t s = 0; s < o.prop_streams; ++s) {
+            const uint64_t count = roots / o.prop_streams + (s < roots % o.prop_streams ? 1 : 0);
             StoredZlib z(out);
             Writer<StoredZlib> w(z);
             int32_t tab_pair = 0, key_pair = 0, id_pair = 0;
-            for (uint64_t j = 0; j < roots; ++j) {
+            for (uint64_t n = 0; n < count; ++n, ++j) {
                 if (j % 2 == 0) {
                     w.obj(86);
                     w.null_str();
@@ -1041,13 +1177,15 @@ inline bool write(const std::string& path, const Options& o, Result& result, std
                 }
             }
             w.pad(8);
-            stream_length = z.finish();
+            const uint64_t stream_length = z.finish();
+            if (stream_length > 0x7FFFFFFF)
+                return fail("a property stream is larger than its 32-bit length allows");
+            stream_lengths.push_back(static_cast<int32_t>(stream_length));
         }
-        if (stream_length > 0x7FFFFFFF) return fail("the property stream is larger than its 32-bit length allows");
         StoredZlib z(out);
         Writer<StoredZlib> toc(z);
-        toc.i32(1);
-        toc.i32(static_cast<int32_t>(stream_length));
+        toc.i32(static_cast<int32_t>(o.prop_streams));
+        for (const int32_t length : stream_lengths) toc.i32(length);
         toc.pad(8);
         const uint64_t b = z.finish();
         entries.push_back({"LcOaPartitionProps", offset, out.pos() - offset, 4, static_cast<int32_t>(b)});

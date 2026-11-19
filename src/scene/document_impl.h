@@ -137,9 +137,11 @@ private:
 
 // En modell i trädet (se Document::model()). Vyerna pekar in i samma TreeData.
 struct ModelEntry {
-    uint32_t node = 0;   // förekomsten: en toppnod, eller roten
+    uint32_t node = 0;   // förekomsten: en nod av klass 32, eller roten
     std::string_view name, source, loader;
     int32_t unit_code = 0;
+    uint32_t parent = kNone;   // index i TreeData::models; kNone på översta nivån
+    uint32_t depth = 0;
 };
 
 // Det load_tree() har läst. Oföränderligt när det är publicerat; delas med
@@ -154,6 +156,8 @@ struct TreeData : std::enable_shared_from_this<TreeData> {
     // läses om genom.
     detail::HierarchyStreams streams;
     detail::HierarchySkeleton skeleton;
+    // Bara i Structure: per lagrad nod, sann om noden har mer än en förekomst.
+    std::vector<bool> repeated;
     // Filens egen partition, när modellen tas ur den.
     bool has_own_partition = false;
     detail::Partition own_partition;

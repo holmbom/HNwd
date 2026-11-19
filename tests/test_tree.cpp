@@ -1,5 +1,6 @@
 // HNwd::Document: trädet. Syntetiska filer med träd, egenskapspaket, GUID-tabell,
-// fragment och geometri, deras fel, och exempelfilerna.
+// fragment och geometri, deras fel, modeller i flera nivåer, delade flikar i
+// egenskapsläsaren, och exempelfilerna.
 
 #include <algorithm>
 #include <cstdio>
@@ -472,7 +473,6 @@ int check_tree(const Document& doc, const char* label, TreeStats& st) {
         if (i > 0) {
             CHECK(node.parent < i);
             CHECK(node.kind != NodeKind::Root);
-            CHECK(node.kind != NodeKind::Partition || node.parent == 0);
             CHECK(node.element >= 0 && static_cast<size_t>(node.element) <= doc.guid_count());
             if (node.name.empty()) ++st.unnamed;
             if (!node.material.empty()) ++st.with_material;
@@ -484,6 +484,9 @@ int check_tree(const Document& doc, const char* label, TreeStats& st) {
             Node parent;
             CHECK(doc.node(node.parent, parent));
             CHECK(parent.kind != NodeKind::Leaf);
+            // En partition sitter under roten eller under en annan partition.
+            CHECK(node.kind != NodeKind::Partition || parent.kind == NodeKind::Root ||
+                  parent.kind == NodeKind::Partition);
         }
         CHECK(node.subtree_size >= 1 && static_cast<uint64_t>(i) + node.subtree_size <= n);
         if (node.kind == NodeKind::Leaf) CHECK(node.child_count == 0 && node.subtree_size == 1);
@@ -1102,6 +1105,355 @@ int test_shared_deep() {
     return fails;
 }
 
+// ---------------------------------------------------------------------------
+// Modeller i flera nivåer.
+
+// En partitionssvans med enhetskoden `unit`, inläsaren och källsökvägen; utan
+// ljus och utan text.
+void partition_tail(ByteWriter& w, int32_t unit, const char* loader, const char* source) {
+    w.i32(2);
+    w.i32(0);   // inga ljus
+    for (const double v : {0.3, 0.3, 0.3}) w.f64(v);
+    w.i32(0);
+    w.str(loader);
+    w.i32(451);
+    w.i32(unit);
+    w.i32(1);
+    for (const double v : {0.0, 0.0, 1.0, 0.0, 1.0, 0.0}) w.f64(v);
+    w.i32(0);   // ingen text
+    w.null_str();
+    w.i32(1);
+    w.str(source);
+    for (const double v : {0.0, 1.0, 0.0, 1.0, 2.0, 3.0, 4.0}) w.f64(v);
+    w.i32(1);
+    w.pad(8);
+}
+
+// Huvudet på en nod av klass 32 utan attribut, med `children` barn efter sig
+// och sedan svansen. `name` nullptr ger ett nodnamn som saknas, och då ger
+// `display` visningsnamnet. Ger nodens id.
+int32_t partition_head(ByteWriter& w, const char* name, const char* display, int32_t children) {
+    const int32_t id = w.obj(32);
+    w.i32(0);
+    if (name)
+        w.str(name);
+    else
+        w.null_str();
+    if (display)
+        pair(w, display, "LcPartition");
+    else
+        w.null_ptr();
+    w.i32(0);   // flaggor
+    w.i32(0);   // element
+    w.i32(0);   // attribut
+    w.i32(children);
+    return id;
+}
+
+void leaf_node(ByteWriter& w, const char* name) {
+    w.obj(22);
+    w.str(name);
+    w.null_ptr();
+    w.i32(0);
+    w.i32(0);
+    w.i32(0);
+}
+
+// Tre nivåer av klass 32 och en fjärde modell, i preorder:
+//  0 roten
+//  1 M1 (enhet 3)        2 La   3 M2 (enhet 2)   4 Lb   5 M3 (enhet 1)   6 Lc
+//  7 Ld (under M2)       8 Le (under M1)
+//  9 G, en grupp         10 Lf
+// 11 M4 (enhet 0, visningsnamn utan eget namn)    12 Lg
+// Med `duplicate` sitter M4 också som en tredje toppnod genom en bakåtpekare:
+// 13 M4    14 Lg.
+Bytes nested_tree(bool duplicate) {
+    ByteWriter w;
+    w.i32(1);
+    w.i32(0);
+    w.implicit_root();
+    w.i32(duplicate ? 4 : 3);
+
+    partition_head(w, "M1", nullptr, 3);
+    leaf_node(w, "La");
+    partition_head(w, "M2", nullptr, 3);
+    leaf_node(w, "Lb");
+    partition_head(w, "M3", nullptr, 1);
+    leaf_node(w, "Lc");
+    partition_tail(w, 1, "LcNwcLoaderPlugin:m3", "C:\\src\\m3.src");
+    leaf_node(w, "Ld");
+    partition_tail(w, 2, "LcNwcLoaderPlugin:m2", "C:\\src\\m2.src");
+    leaf_node(w, "Le");
+    partition_tail(w, 3, "LcNwcLoaderPlugin:m1", "C:\\src\\m1.src");
+
+    w.obj(53);
+    w.str("G");
+    w.null_ptr();
+    w.i32(0);
+    w.i32(0);
+    w.i32(0);
+    w.i32(1);
+    leaf_node(w, "Lf");
+
+    const int32_t m4 = partition_head(w, nullptr, "M4 Display", 1);
+    leaf_node(w, "Lg");
+    partition_tail(w, 0, "LcNwcLoaderPlugin:m4", "C:\\src\\m4.src");
+    if (duplicate) w.ref(m4);
+
+    w.i32(1);
+    w.pad(8);
+    return w.data;
+}
+
+struct ExpectModel {
+    uint32_t node;
+    const char *name, *loader, *source;
+    int32_t code;
+    HNwd::LengthUnit unit;
+    double metres;
+    uint32_t first, count, parent, depth;
+};
+
+const ExpectModel kNestedModels[5] = {
+    {1, "M1", "LcNwcLoaderPlugin:m1", "C:\\src\\m1.src", 3, HNwd::LengthUnit::Foot, 0.3048, 0, 5, kNone, 0},
+    {3, "M2", "LcNwcLoaderPlugin:m2", "C:\\src\\m2.src", 2, HNwd::LengthUnit::Millimetre, 0.001, 1, 3, 0, 1},
+    {5, "M3", "LcNwcLoaderPlugin:m3", "C:\\src\\m3.src", 1, HNwd::LengthUnit::Centimetre, 0.01, 2, 1, 1, 2},
+    {11, "M4 Display", "LcNwcLoaderPlugin:m4", "C:\\src\\m4.src", 0, HNwd::LengthUnit::Metre, 1.0, 6, 1,
+     kNone, 0},
+    {13, "M4 Display", "LcNwcLoaderPlugin:m4", "C:\\src\\m4.src", 0, HNwd::LengthUnit::Metre, 1.0, 7, 1,
+     kNone, 0},
+};
+
+// Innersta modellen per nod 0..12, och per fragment (seq 2, 4, 6, 7, 8, 10, 12).
+const uint32_t kNestedOfNode[13] = {kNone, 0, 0, 1, 1, 2, 2, 1, 0, kNone, kNone, 3, 3};
+const uint32_t kNestedOfFragment[6] = {0, 1, 2, 1, 0, kNone};
+
+// Modellerna, noderna och fragmenten i det träd nested_tree() skriver.
+int check_nested(const Document& doc, bool duplicate) {
+    int fails = 0;
+    const size_t models = duplicate ? 5 : 4;
+    const uint32_t nodes = duplicate ? 15 : 13;
+    const size_t fragments = duplicate ? 8 : 7;
+    CHECK(doc.node_count() == nodes && doc.fragment_count() == fragments);
+    CHECK(doc.model_count() == models);
+    for (size_t i = 0; i < models; ++i) {
+        HNwd::Model m;
+        const ExpectModel& e = kNestedModels[i];
+        CHECK(doc.model(i, m));
+        CHECK(m.name == e.name && m.loader == e.loader && m.source == e.source);
+        CHECK(m.unit.code == e.code && m.unit.unit == e.unit && m.unit.metres_per_unit == e.metres);
+        CHECK(m.node == e.node && m.first_fragment == e.first && m.fragment_count == e.count);
+        CHECK(m.parent == e.parent && m.depth == e.depth);
+        Node n;
+        CHECK(doc.node(m.node, n) && n.kind == NodeKind::Partition && n.name == e.name);
+    }
+    HNwd::Model none;
+    CHECK(!doc.model(models, none));
+
+    for (uint32_t i = 0; i < nodes; ++i) {
+        const uint32_t expected = i < 13 ? kNestedOfNode[i] : 4;
+        CHECK(doc.model_of_node(i) == expected);
+    }
+    CHECK(doc.model_of_node(nodes) == kNone && doc.model_of_node(kNone) == kNone);
+    for (size_t f = 0; f < fragments; ++f) {
+        const uint32_t expected = f < 6 ? kNestedOfFragment[f] : f == 6 ? 3 : 4;
+        CHECK(doc.model_of_fragment(f) == expected);
+    }
+    CHECK(doc.model_of_fragment(fragments) == kNone);
+    return fails;
+}
+
+int test_nested_models() {
+    int fails = 0;
+    for (const bool duplicate : {false, true}) {
+        Spec sp;
+        sp.tree = nested_tree(duplicate);
+        sp.seqs = {2, 4, 6, 7, 8, 10, 12};
+        if (duplicate) sp.seqs.push_back(14);
+        sp.guids = false;
+        sp.props_package = false;
+        sp.props.clear();
+        for (const bool fragments_first : {false, true}) {
+            for (const HNwd::TreeContent content :
+                 {HNwd::TreeContent::Full, HNwd::TreeContent::Structure}) {
+                Opened o("hnwd_test_tree_nested.nwd", build(sp));
+                Document& doc = o.doc;
+                CHECK(o.status == Status::Ok);
+                if (o.status != Status::Ok) return fails;
+
+                // Med bara det ena inläst finns inga modeller.
+                if (fragments_first)
+                    CHECK(doc.load_fragments() == Status::Ok);
+                else
+                    CHECK(doc.load_tree(content) == Status::Ok);
+                HNwd::Model m;
+                CHECK(doc.model_count() == 0 && !doc.model(0, m));
+                CHECK(doc.model_of_node(1) == kNone && doc.model_of_fragment(0) == kNone);
+                if (fragments_first)
+                    CHECK(doc.load_tree(content) == Status::Ok);
+                else
+                    CHECK(doc.load_fragments() == Status::Ok);
+                if (doc.node_count() != (duplicate ? 15u : 13u) ||
+                    doc.fragment_count() != (duplicate ? 8u : 7u))
+                    return fails + 1;
+
+                fails += check_nested(doc, duplicate);
+
+                // Trädet hänger ihop: partitioner under partitioner, och en
+                // grupp på toppnivå.
+                TreeStats st;
+                fails += check_tree(doc, "nested", st);
+                CHECK(st.partitions == (duplicate ? 5u : 4u) && st.groups == 1 &&
+                      st.leaves == (duplicate ? 8u : 7u));
+                Node n;
+                CHECK(doc.node(3, n) && n.parent == 1 && n.kind == NodeKind::Partition);
+                CHECK(doc.node(5, n) && n.parent == 3 && n.subtree_size == 2);
+                CHECK(doc.node(9, n) && n.kind == NodeKind::Group && n.parent == 0);
+                CHECK(doc.node(11, n) && n.name == "M4 Display" && n.parent == 0);
+            }
+        }
+    }
+    return fails;
+}
+
+// ---------------------------------------------------------------------------
+// Delade flikar och upprepade delträd i egenskapsläsaren.
+
+// Preorder: 0 roten, 1 A, 2 L1, 3 L2, 4 L3, 5 B, 6 A, 7 L1, 8 L2, 9 L3. A äger
+// fliken S och tar de två rötterna ur egenskapsströmmen; L1, L3 och B delar S
+// genom bakåtpekare, och A sitter också under B.
+Bytes shared_tree() {
+    ByteWriter w;
+    w.i32(1);
+    w.i32(2);
+    w.implicit_root();
+    w.i32(2);
+
+    const int32_t a = w.obj(53);
+    w.str("A");
+    w.null_ptr();
+    w.i32(0);
+    w.i32(0);
+    w.i32(3);
+    const int32_t shared = w.next_id;   // item_tab() skriver objektet med detta id
+    item_tab(w);
+    w.null_ptr();
+    w.null_ptr();
+    w.i32(3);
+    for (const char* name : {"L1", "L2", "L3"}) {
+        w.obj(22);
+        w.str(name);
+        w.null_ptr();
+        w.i32(0);
+        w.i32(0);
+        if (name[1] == '2') {
+            w.i32(0);
+        } else {
+            w.i32(1);
+            w.ref(shared);
+        }
+    }
+
+    w.obj(53);
+    w.str("B");
+    w.null_ptr();
+    w.i32(0);
+    w.i32(0);
+    w.i32(1);
+    w.ref(shared);
+    w.i32(1);
+    w.ref(a);
+
+    w.i32(1);
+    w.pad(8);
+    return w.data;
+}
+
+// Flikarna och egenskaperna som text, så att läsningar kan jämföras efter att
+// vyerna slutat gälla.
+std::string props_text(const HNwd::NodeProperties& p) {
+    std::string s;
+    size_t k = 0;
+    char buf[64];
+    for (const HNwd::Tab& t : p.tabs) {
+        s += "T:" + std::string(t.name) + '|' + std::string(t.internal) + '|' +
+             std::to_string(t.property_count) + '\n';
+        for (uint32_t j = 0; j < t.property_count && k < p.properties.size(); ++j, ++k) {
+            const HNwd::Property& q = p.properties[k];
+            s += " P:" + std::string(q.name) + '|' + std::string(q.internal) + '|' +
+                 std::to_string(q.raw_type) + '|' + std::to_string(static_cast<int>(q.type)) + '|';
+            for (const double d : q.d) {
+                std::snprintf(buf, sizeof buf, "%a|", d);
+                s += buf;
+            }
+            s += std::to_string(q.i) + '|' + std::string(q.text) + '\n';
+        }
+    }
+    return s + "#" + std::to_string(p.properties.size()) + "/" + std::to_string(k);
+}
+
+// Läser noderna i `order` med `reader` och räknar de som inte är lika med
+// `expected`.
+size_t read_nodes(HNwd::PropertyReader& reader, const std::vector<std::string>& expected,
+                  const std::vector<uint32_t>& order) {
+    size_t bad = 0;
+    HNwd::NodeProperties p;
+    for (const uint32_t i : order)
+        if (reader.read(i, p) != Status::Ok || props_text(p) != expected[i]) ++bad;
+    return bad;
+}
+
+int test_shared_properties() {
+    int fails = 0;
+    Spec sp;
+    sp.tree = shared_tree();
+    sp.fragments = false;
+    sp.guids = false;
+    Opened full("hnwd_test_tree_shared_full.nwd", build(sp));
+    Opened st("hnwd_test_tree_shared_structure.nwd", build(sp));
+    CHECK(full.status == Status::Ok && st.status == Status::Ok);
+    if (full.status != Status::Ok || st.status != Status::Ok) return fails + 1;
+    CHECK(full.doc.load_tree(HNwd::TreeContent::Full) == Status::Ok);
+    CHECK(st.doc.load_tree(HNwd::TreeContent::Structure) == Status::Ok);
+    constexpr uint32_t kNodes = 10;
+    CHECK(full.doc.node_count() == kNodes && st.doc.node_count() == kNodes);
+    if (full.doc.node_count() != kNodes || st.doc.node_count() != kNodes) return fails + 1;
+
+    // Facit: Full, ur minnet. S delas av L1, L3 och B, och A är samma på båda ställena.
+    CHECK(check_a_tabs(full.doc, 1) == 0 && check_a_tabs(full.doc, 6) == 0);
+    const size_t tabs[kNodes] = {0, 3, 1, 0, 1, 1, 3, 1, 0, 1};
+    for (uint32_t i = 0; i < kNodes; ++i) CHECK(full.doc.tab_count(i) == tabs[i]);
+    HNwd::PropertyReader reference;
+    CHECK(reference.open(full.doc) == Status::Ok);
+    std::vector<std::string> expected(kNodes);
+    for (uint32_t i = 0; i < kNodes; ++i) {
+        HNwd::NodeProperties p;
+        CHECK(reference.read(i, p) == Status::Ok && p.tabs.size() == tabs[i]);
+        expected[i] = props_text(p);
+    }
+    CHECK(expected[2] == expected[4] && expected[2] == expected[5] && expected[2] == expected[7]);
+    CHECK(expected[1] == expected[6] && expected[2] != expected[3]);
+
+    std::vector<uint32_t> up(kNodes), down(kNodes);
+    for (uint32_t i = 0; i < kNodes; ++i) {
+        up[i] = i;
+        down[i] = kNodes - 1 - i;
+    }
+    // Läsarens tak: ingen cache, en som inte rymmer mycket, och förvalet.
+    for (const size_t cache : {size_t(0), size_t(512), size_t(-1)}) {
+        HNwd::PropertyReader reader;
+        CHECK((cache == size_t(-1) ? reader.open(st.doc) : reader.open(st.doc, cache)) == Status::Ok);
+        CHECK(read_nodes(reader, expected, up) == 0);       // stigande
+        CHECK(read_nodes(reader, expected, down) == 0);     // fallande, med det som cachen håller
+        CHECK(read_nodes(reader, expected, down) == 0);
+        CHECK(read_nodes(reader, expected, up) == 0);
+        HNwd::NodeProperties p;
+        CHECK(reader.read(kNodes, p) == Status::OutOfRange && p.tabs.empty());
+        CHECK(read_nodes(reader, expected, up) == 0);       // läsaren fungerar efter felet
+    }
+    return fails;
+}
+
 int test_samples() {
     int fails = 0;
     size_t nwc_nodes[9] = {};
@@ -1335,8 +1687,10 @@ std::string_view file_name(std::string_view path) {
     return cut == std::string_view::npos ? path : path.substr(cut + 1);
 }
 
-// Modellerna: intervallen ligger i följd utan glapp, och varje fragment i ett
-// intervall sitter i modellens delträd.
+// Modellerna: intervallen på översta nivån ligger i följd utan glapp, en
+// nästlad modells intervall och delträd ligger i förälderns, och varje
+// fragment i ett intervall sitter i modellens delträd. Varje fragments innersta
+// modell har fragmentet i sitt intervall.
 int check_models(const Document& doc, const char* label) {
     int fails = 0;
     uint64_t next = 0;
@@ -1348,8 +1702,20 @@ int check_models(const Document& doc, const char* label) {
         }
         Node n;
         CHECK(doc.node(m.node, n));
-        CHECK(m.first_fragment == next);
-        next = uint64_t(m.first_fragment) + m.fragment_count;
+        if (m.parent == kNone) {
+            CHECK(m.depth == 0);
+            CHECK(m.first_fragment == next);
+            next = uint64_t(m.first_fragment) + m.fragment_count;
+        } else {
+            HNwd::Model p;
+            Node pn;
+            CHECK(m.parent < i && doc.model(m.parent, p) && doc.node(p.node, pn));
+            CHECK(m.depth == p.depth + 1);
+            CHECK(m.node > p.node && m.node + n.subtree_size <= p.node + pn.subtree_size);
+            CHECK(m.first_fragment >= p.first_fragment &&
+                  uint64_t(m.first_fragment) + m.fragment_count <=
+                      uint64_t(p.first_fragment) + p.fragment_count);
+        }
         uint64_t bad = 0;
         for (uint32_t f = m.first_fragment; f < m.first_fragment + m.fragment_count; ++f) {
             const uint32_t leaf = doc.node_of_fragment(f);
@@ -1366,6 +1732,17 @@ int check_models(const Document& doc, const char* label) {
     CHECK(next == doc.fragment_count());
     HNwd::Model m;
     CHECK(!doc.model(doc.model_count(), m));
+
+    uint64_t wrong = 0;
+    for (size_t f = 0; f < doc.fragment_count(); ++f) {
+        const uint32_t inner = doc.model_of_fragment(f);
+        if (inner != doc.model_of_node(doc.node_of_fragment(f)) ||
+            !doc.model(inner, m) || f < m.first_fragment || f >= uint64_t(m.first_fragment) + m.fragment_count)
+            ++wrong;
+    }
+    CHECK(wrong == 0);
+    if (wrong) std::printf("  FAIL — %s: %llu fragments have a wrong innermost model\n", label,
+                           static_cast<unsigned long long>(wrong));
     return fails;
 }
 
@@ -1414,6 +1791,8 @@ int test_structure_samples() {
             CHECK(a.name == b.name && a.source == b.source && a.loader == b.loader &&
                   a.unit.code == b.unit.code && a.node == b.node &&
                   a.first_fragment == b.first_fragment && a.fragment_count == b.fragment_count);
+            // Exempelfilerna har ingen nästling.
+            CHECK(a.parent == kNone && a.depth == 0 && b.parent == kNone && b.depth == 0);
         }
         for (size_t i = 0; i < st.fragment_count(); ++i)
             if (st.node_of_fragment(i) != fragment_at(st, i).seq) {
@@ -1473,6 +1852,8 @@ int test_tree() {
     fails += test_errors();
     fails += test_small();
     fails += test_shared_deep();
+    fails += test_nested_models();
+    fails += test_shared_properties();
     fails += test_samples();
     fails += test_structure_synthetic();
     fails += test_repeat_and_cancel();

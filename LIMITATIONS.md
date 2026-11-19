@@ -11,7 +11,10 @@ what has been tested against files, is in [doc/format.md](doc/format.md).
 ## The format: what is not decoded
 
 - **The length unit.** Codes 0–3 are metres, centimetres, millimetres and
-  feet. Codes above 3 have not been seen.
+  feet. Codes above 3 have not been seen. A model inside another model has
+  its own code, returned as stored; whether the poses of its fragments are
+  already converted to the enclosing model's unit is not confirmed in every
+  case.
 - **Text (class 103)** is returned as a string, a box, a rotation and a font
   index, together with the names and sizes of the fonts in the list. That the
   index points into that list is not confirmed. The glyphs are not decoded;
@@ -80,3 +83,8 @@ what has been tested against files, is in [doc/format.md](doc/format.md).
   error where it differs.
 - **Paths over 260 characters on Windows** require the caller to give them
   with the prefix `\\?\`.
+- **Reading properties backwards in `TreeContent::Structure`**: a node whose
+  tabs are not in the reader's cache, and which lies before the reader's
+  position in the stream, costs a decompression from the nearest checkpoint,
+  up to 1 MiB. Nodes in ascending order, and nodes that sit in several places
+  in the tree, do not.

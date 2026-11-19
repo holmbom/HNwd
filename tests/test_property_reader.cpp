@@ -203,6 +203,16 @@ int test_samples() {
         const std::vector<uint32_t> back = backward(n, kBackwardReads);
         CHECK(read_all(rs, expected, back) == 0);
 
+        // Läsarens tak: ingen cache och en liten ger samma flikar som Full,
+        // framlänges och baklänges med samma läsare.
+        for (const size_t cache : {size_t(0), size_t(4096)}) {
+            PropertyReader rc;
+            CHECK(rc.open(st, cache) == Status::Ok);
+            CHECK(read_all(rc, expected, all) == 0);
+            CHECK(read_all(rc, expected, back) == 0);
+            CHECK(read_all(rc, expected, all) == 0);
+        }
+
         // Två läsare i var sin tråd, i var sin riktning.
         {
             PropertyReader r1, r2;

@@ -23,7 +23,7 @@ endif()
 
 FetchContent_Declare(GlazeUI
     GIT_REPOSITORY https://github.com/holmbom/GlazeUI.git
-    GIT_TAG        v0.10.0
+    GIT_TAG        v0.11.0
     GIT_SHALLOW    TRUE)
 FetchContent_MakeAvailable(GlazeUI)
 

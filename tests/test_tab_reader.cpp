@@ -6,6 +6,7 @@
 #include <functional>
 #include <initializer_list>
 #include <numeric>
+#include <random>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -329,20 +330,92 @@ uint32_t node_named(const Hierarchy& h, const char* name) {
     return kNone;
 }
 
-// Varje nod, i ordningen `order`, med en läsare som återanvänds.
-int check_every_node(const TreeFile& f, const Parsed& p, const std::vector<uint32_t>& order) {
+// Varje nod i `order` genom `reader`, lika med Full i `full`, och cachen under
+// taket `cap` efter varje läsning. `keep` ges vidare till read().
+int check_reader(TabReader& reader, const Hierarchy& full, const std::vector<uint32_t>& order,
+                 size_t cap, bool keep = false) {
     int fails = 0;
-    TabReader reader(f.file.data(), f.file.size(), f.streams, p.structure, p.skeleton);
     for (const uint32_t i : order) {
         NodeTabs t;
         std::string detail;
-        const ErrorCode e = reader.read(i, t, &detail);
-        if (e != ErrorCode::Ok || !same_tabs(p.full, i, t)) {
-            std::printf("  node %u: %s %s\n", i, error_message(e), detail.c_str());
-            ++fails;
+        const ErrorCode e = reader.read(i, t, &detail, keep);
+        if (e != ErrorCode::Ok || !same_tabs(full, i, t)) {
+            if (fails++ < 5) std::printf("  node %u: %s %s\n", i, error_message(e), detail.c_str());
+        }
+        if (reader.cached_bytes() > cap) {
+            if (fails++ < 5)
+                std::printf("  node %u: the cache holds %zu bytes, over the cap %zu\n", i,
+                            reader.cached_bytes(), cap);
         }
     }
     return fails;
+}
+
+// Varje nod, i ordningen `order`, med en läsare som återanvänds.
+int check_every_node(const TreeFile& f, const Parsed& p, const std::vector<uint32_t>& order) {
+    TabReader reader(f.file.data(), f.file.size(), f.streams, p.structure, p.skeleton);
+    return check_reader(reader, p.full, order, 0);
+}
+
+// Toppnoden har 61 löv. Löv 0 äger fliken S; löv 1–60 pekar bakåt på S och har
+// var sin egen flik.
+constexpr int kSharedLeaves = 61;
+
+struct SharedGraph {
+    Bytes tree;
+    size_t s_type = 0;   // byten där typen på S:s första egenskap står
+};
+
+SharedGraph shared_graph() {
+    SharedGraph g;
+    ByteWriter w;
+    header(w, {0}, 1);
+    node_head(w, 53, "Top", 0);
+    w.i32(kSharedLeaves);
+    int32_t s = 0;
+    for (int i = 0; i < kSharedLeaves; ++i) {
+        const std::string name = "L" + std::to_string(i);
+        if (i == 0) {
+            node_head(w, 22, name.c_str(), 1);
+            s = w.obj(86);
+            w.str("S");
+            const int32_t user = name_pair(w, "S", "LcS");
+            w.i32(0);
+            w.i32(5);
+            w.ref(user);
+            g.s_type = w.data.size();
+            w.i32(2);
+            w.i32(10);
+            w.ref(user);
+            w.i32(2);
+            w.i32(20);
+            // En tom sträng, en null-sträng och ett värde av typ 9: cachen ska
+            // skilja dem åt.
+            w.ref(user);
+            w.i32(4);
+            w.str("");
+            w.ref(user);
+            w.i32(4);
+            w.null_str();
+            w.ref(user);
+            w.i32(9);
+            w.str("nine");
+        } else {
+            node_head(w, 22, name.c_str(), 2);
+            w.ref(s);
+            tab_with_ints(w, ("T" + name).c_str(), {i});
+        }
+    }
+    finish(w);
+    g.tree = w.data;
+    return g;
+}
+
+// Löven i `h` i ordningen L0, L1, …; kNone för ett som saknas.
+std::vector<uint32_t> shared_leaves(const Hierarchy& h) {
+    std::vector<uint32_t> out;
+    for (int i = 0; i < kSharedLeaves; ++i) out.push_back(node_named(h, ("L" + std::to_string(i)).c_str()));
+    return out;
 }
 
 // --- Exempelfilerna -----------------------------------------------------------------
@@ -399,10 +472,95 @@ std::vector<std::string> sorted_names(const Hierarchy& h) {
     return out;
 }
 
+// En egenskapsrot med samma id som en delad flik i trädet. Löv 0 äger fliken S
+// i trädets ström; varje annat löv pekar bakåt på S och tar en rot ur
+// egenskapsströmmen. Strömmarna räknar sina id var för sig, och med `roots`
+// rötter får en av dem S:s id. `shared` får S:s id och `root_ids` rötternas.
+struct CollidingGraph {
+    Bytes tree;
+    Streams props;
+    int32_t shared = 0;
+    std::vector<int32_t> root_ids;
+};
+
+CollidingGraph colliding_graph(int32_t roots) {
+    CollidingGraph g;
+    ByteWriter w;
+    header(w, {roots}, 1);
+    node_head(w, 53, "Top", 0);
+    w.i32(1 + roots);
+    node_head(w, 22, "L0", 1);
+    g.shared = tab_with_ints(w, "S", {1, 2});
+    for (int32_t i = 1; i <= roots; ++i) {
+        node_head(w, 22, ("L" + std::to_string(i)).c_str(), 2);
+        w.ref(g.shared);
+        w.null_ptr();
+    }
+    finish(w);
+    g.tree = w.data;
+
+    // Rötterna delar ett namnpar, så att deras id ligger i följd efter det.
+    ByteWriter s;
+    int32_t key = 0;
+    for (int32_t j = 0; j < roots; ++j) {
+        g.root_ids.push_back(s.obj(86));
+        s.str(("R" + std::to_string(j)).c_str());
+        if (j == 0) key = name_pair(s, "K", "LcK");
+        else s.ref(key);
+        s.i32(0);
+        s.i32(1);
+        s.ref(key);
+        s.i32(2);
+        s.i32(1000 + j);
+    }
+    s.pad(8);
+    g.props.push_back(s.data);
+    return g;
+}
+
+int check_colliding_ids() {
+    int fails = 0;
+    // S:s id beror inte på antalet rötter, så det tas ur ett första bygge.
+    const int32_t shared = colliding_graph(1).shared;
+    CHECK(shared >= 102);
+    const CollidingGraph g = colliding_graph(shared - 100 + 1);
+    CHECK(g.shared == shared);
+    bool collides = false;
+    for (const int32_t id : g.root_ids) collides = collides || id == shared;
+    CHECK(collides);
+
+    const TreeFile f = tree_file(g.tree, g.props, 64);
+    Parsed p;
+    CHECK(parse_both(f, 40, p));
+    std::vector<uint32_t> leaves;
+    for (size_t i = 0; i <= g.root_ids.size(); ++i)
+        leaves.push_back(node_named(p.full, ("L" + std::to_string(i)).c_str()));
+    for (const uint32_t leaf : leaves) CHECK(leaf != kNone);
+    const size_t cap = size_t(1) << 20;
+
+    // Varje löv ensamt med en ny läsare: roten läses före den delade fliken,
+    // och får inte hamna i cachen under flikens id.
+    for (const uint32_t leaf : leaves) {
+        TabReader reader(f.file.data(), f.file.size(), f.streams, p.structure, p.skeleton, cap);
+        CHECK(check_reader(reader, p.full, {leaf}, cap) == 0);
+        CHECK(check_reader(reader, p.full, {leaf}, cap) == 0);
+    }
+    // Fallande och stigande med en och samma läsare.
+    {
+        TabReader reader(f.file.data(), f.file.size(), f.streams, p.structure, p.skeleton, cap);
+        std::vector<uint32_t> down(leaves.rbegin(), leaves.rend());
+        CHECK(check_reader(reader, p.full, down, cap) == 0);
+        CHECK(check_reader(reader, p.full, leaves, cap) == 0);
+        CHECK(reader.stats().tab_hits > 0);
+    }
+    return fails;
+}
+
 } // namespace
 
 int test_tab_reader() {
     int fails = 0;
+    fails += check_colliding_ids();
 
     // Den syntetiska grafen: varje nod lika med Full, med tätt och glest mellan
     // kontrollpunkterna, i ordning, baklänges och en i taget.
@@ -563,6 +721,166 @@ int test_tab_reader() {
         CHECK(read(good, fnode, no_roots, p.structure, detail) == ErrorCode::CorruptLink);
     }
 
+    // Cachen: löv 0 äger fliken S och löv 1–60 pekar bakåt på den. Varje nod ska
+    // vara lika med Full, och räknarna visar vad som lästs ur filen.
+    {
+        const SharedGraph g = shared_graph();
+        TreeFile f = tree_file(g.tree, {}, 64);
+        f.streams.has_props = false;
+        Parsed p;
+        const bool parsed = parse_both(f, 256, p);
+        CHECK(parsed);
+        const std::vector<uint32_t> leaf = shared_leaves(p.structure);
+        const bool found = std::find(leaf.begin(), leaf.end(), kNone) == leaf.end() &&
+                           p.structure.nodes.size() == static_cast<size_t>(kSharedLeaves) + 1;
+        CHECK(found);
+        if (parsed && found) {
+            const size_t mib = size_t(1) << 20;
+            std::vector<uint32_t> asc(p.structure.nodes.size());
+            std::iota(asc.begin(), asc.end(), 0u);
+            const std::vector<uint32_t> desc(asc.rbegin(), asc.rend());
+            auto make = [&](const TreeFile& file, size_t cap) {
+                return TabReader(file.file.data(), file.file.size(), file.streams, p.structure,
+                                 p.skeleton, cap);
+            };
+
+            // Stigande: löv 0 läser S, och de 60 andra tar den ur cachen utan att
+            // öppna en läsare för den. Uppackningen går framåt en gång genom
+            // strömmen, och aldrig längre än dess längd.
+            {
+                TabReader r = make(f, mib);
+                fails += check_reader(r, p.full, asc, mib);
+                const TabReaderStats s = r.stats();
+                CHECK(s.opens[2] == 0);
+                CHECK(s.tab_hits == 60);
+                CHECK(s.node_hits == 0 && s.reads == asc.size());
+                CHECK(r.cached_bytes() > 0);
+                CHECK(s.inflated > 0 && s.inflated <= g.tree.size());
+            }
+
+            // Fallande: det första lövet läser S ur dess egen position, och de
+            // 59 andra som delar den tar den ur cachen.
+            {
+                TabReader r = make(f, mib);
+                fails += check_reader(r, p.full, desc, mib);
+                const TabReaderStats s = r.stats();
+                CHECK(s.opens[2] == 1);
+                CHECK(s.tab_hits == 59);
+            }
+
+            // Utan cache läses S om för vart och ett av de 60 lövens skull.
+            {
+                TabReader r = make(f, 0);
+                fails += check_reader(r, p.full, asc, 0);
+                const TabReaderStats s = r.stats();
+                CHECK(s.opens[2] == 60);
+                CHECK(s.tab_hits == 0 && s.node_hits == 0);
+                CHECK(r.cached_bytes() == 0);
+            }
+
+            // Med `keep` svarar cachen för en nod som läses igen; utan läses den om.
+            for (const bool keep : {true, false}) {
+                TabReader r = make(f, mib);
+                NodeTabs a, b;
+                std::string detail = "stale";
+                const uint32_t n = leaf[7];
+                CHECK(r.read(n, a, &detail, keep) == ErrorCode::Ok);
+                const uint64_t opens = r.stats().opens[0];
+                detail = "stale";
+                CHECK(r.read(n, b, &detail, keep) == ErrorCode::Ok);
+                CHECK(same_tabs(p.full, n, a) && same_tabs(p.full, n, b));
+                CHECK(detail.empty());
+                const TabReaderStats s = r.stats();
+                CHECK(s.reads == 2);
+                CHECK(s.node_hits == (keep ? 1u : 0u));
+                CHECK(s.opens[0] == (keep ? opens : 2 * opens));
+            }
+
+            // Ett tak som ingen post ryms under: inget sparas, och inget svar ur cachen.
+            {
+                TabReader r = make(f, 1);
+                fails += check_reader(r, p.full, asc, 1, true);
+                fails += check_reader(r, p.full, asc, 1, true);
+                const TabReaderStats s = r.stats();
+                CHECK(r.cached_bytes() == 0);
+                CHECK(s.node_hits == 0 && s.tab_hits == 0 && s.opens[2] == 120);
+            }
+
+            // Ett tak för tre poster, med noder och flikar som kastas ut: summan
+            // är högst taket efter varje läsning, och resultatet är det samma.
+            {
+                TabReader probe = make(f, mib);
+                NodeTabs t;
+                CHECK(probe.read(leaf[5], t, nullptr, true) == ErrorCode::Ok);
+                const size_t entry = probe.cached_bytes();   // S och noden
+                CHECK(entry > 0);
+                const size_t cap = 3 * entry;
+                TabReader r = make(f, cap);
+                fails += check_reader(r, p.full, asc, cap, true);
+                fails += check_reader(r, p.full, desc, cap, true);
+                CHECK(r.cached_bytes() > 0 && r.cached_bytes() <= cap);
+            }
+
+            // Ett fel i S: löv 0 läser den, löv 1 och 2 läser den ur dess egen
+            // position, och alla tre ger fel. Ingen del av S hamnar i cachen.
+            {
+                TreeFile bad = f;
+                bad.file[file_byte(bad, bad.streams.tree, g.s_type)] = 99;
+                TabReader r(bad.file.data(), bad.file.size(), bad.streams, p.structure, p.skeleton, mib);
+                for (const uint32_t i : {leaf[0], leaf[1], leaf[2], leaf[1]}) {
+                    NodeTabs t;
+                    t.tabs.resize(1);
+                    std::string detail;
+                    const ErrorCode e = r.read(i, t, &detail, true);
+                    CHECK(e == ErrorCode::CorruptObject);
+                    CHECK(detail.find("property value type is unknown") != std::string::npos);
+                    CHECK(t.tabs.empty());
+                    CHECK(r.cached_bytes() == 0);
+                }
+                NodeTabs top;
+                CHECK(r.read(node_named(p.structure, "Top"), top) == ErrorCode::Ok);
+                const TabReaderStats s = r.stats();
+                CHECK(s.tab_hits == 0 && s.node_hits == 0 && s.reads == 1);
+            }
+        }
+    }
+
+    // Den syntetiska grafen med delade flikar, länkar och rötter, i ordning,
+    // baklänges och blandat, och varje nod två gånger, med en cache som rymmer
+    // allt, några poster och ingen: lika med Full.
+    {
+        const Graph g = graph();
+        for (const size_t block : {size_t(8), size_t(65535)}) {
+            const TreeFile f = tree_file(g.tree, g.props, block);
+            Parsed p;
+            if (!parse_both(f, 40, p)) {
+                ++fails;
+                continue;
+            }
+            std::vector<uint32_t> order(p.structure.nodes.size());
+            std::iota(order.begin(), order.end(), 0u);
+            std::vector<std::vector<uint32_t>> orders;
+            orders.push_back(order);
+            orders.emplace_back(order.rbegin(), order.rend());
+            std::mt19937 rng(7919);
+            for (int k = 0; k < 8; ++k) {
+                std::shuffle(order.begin(), order.end(), rng);
+                orders.push_back(order);
+            }
+            for (const size_t cap : {size_t(1) << 20, size_t(700), size_t(64)}) {
+                for (const bool keep : {false, true}) {
+                    for (const std::vector<uint32_t>& o : orders) {
+                        std::vector<uint32_t> twice = o;
+                        twice.insert(twice.end(), o.begin(), o.end());
+                        TabReader reader(f.file.data(), f.file.size(), f.streams, p.structure,
+                                         p.skeleton, cap);
+                        fails += check_reader(reader, p.full, twice, cap, keep);
+                    }
+                }
+            }
+        }
+    }
+
     // Namn valda så att deras hash har bitarna 11..21 noll, och var fjärde en
     // dubblett så att dubblettsökningen står på efter sitt prov. Utan
     // blandning och tak i dubblettabellen hamnar alla i samma kluster och
@@ -672,6 +990,20 @@ int test_tab_reader() {
         const double t_all = seconds_since(t0);
         CHECK(bad == 0);
         CHECK(tabs == full.node_tabs.size());
+
+        // Samma noder genom en läsare med cache: i ordning, sedan baklänges med
+        // en nod av tre i cachen. Lika med Full, och cachen under taket.
+        {
+            const size_t cap = size_t(16) << 20;
+            TabReader cached(s.file.data(), s.file.size(), s.streams, structure, sk, cap);
+            fails += check_reader(cached, full, order, cap);
+            const std::vector<uint32_t> back(order.rbegin(), order.rend());
+            for (size_t k = 0; k < back.size(); ++k) {
+                const std::vector<uint32_t> one(1, back[k]);
+                fails += check_reader(cached, full, one, cap, k % 3 == 0);
+            }
+            CHECK(cached.stats().reads == 2 * order.size());
+        }
 
         // Var 50:e nod för sig, utan en läsare som står nära: från närmaste kontrollpunkt.
         size_t single = 0;

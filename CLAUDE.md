@@ -89,7 +89,7 @@ Filerna i `src/core/`, i den ordning de bygger på varandra:
 | `partition_props.h/.cpp` | `locate_partition_props()`: var strömmarna med de egenskaper en nod använder ensam ligger; `read_partition_props()`: dem uppackade |
 | `partition.h/.cpp` | `parse_partition_stream()`, `read_partition_tail()`: klass 32, noden för en inläst modell; `metres_per_unit()`: enhetskoden i meter |
 | `hierarchy.h/.cpp` | `parse_hierarchy()`: objektträdet som lagrad graf, med flikar, egenskaper, material och placering, helt eller som skelett (`HierarchyContent`, `HierarchySkeleton`); `locate_hierarchy()`, `parse_node_tabs()` |
-| `tab_reader.h/.cpp` | `TabReader`, `read_node_tabs()`: flikarna och egenskaperna för en nod, lästa ur filen från närmaste kontrollpunkt |
+| `tab_reader.h/.cpp` | `TabReader`, `read_node_tabs()`: flikarna och egenskaperna för en nod, lästa ur filen från närmaste kontrollpunkt, med en cache med tak för flikar som flera noder delar och för noder som sitter på flera ställen; `TabReaderStats` |
 | `geometry.h/.cpp` | `parse_record()`: en geometripost till trianglar, linjer eller punkter, också cirklar, cylindermantlar och text; `decode_tokens()`, `decode_packed()`, `parse_geometry_toc()` |
 | `geometry_segment.h/.cpp` | geometripaketet: `GeometryLayout` (oföränderlig när den är läst: chunkarnas och posternas lägen, normalernas bredd) och `GeometryCursor` (en läsares cache, en per tråd); `GeometrySegment` är de två tillsammans |
 | `spatial.h/.cpp` | `parse_spatial_hierarchy()`: filens rumsliga träd över fragmenten |
@@ -103,9 +103,9 @@ Filerna i `src/scene/`:
 | `document.cpp` | `Document` utom trädet: `open`, geometrin, fragmenten, materialen, enheten, GUID, källan, XRef-tabellen, `memory_bytes()`; `world_point()`, `world_normal()`, `mirrors()` |
 | `geometry_reader.cpp` | `GeometryReader`: geometrin för en tråd, med länkkontrollerna mot fragmentet |
 | `spatial_index.cpp` | `load_spatial()`: det rumsliga trädet med världslådor och primitivsummor, ur filen eller byggt här |
-| `tree.cpp` | `load_tree()` och noderna: trädet expanderat i preorder, helt eller som skelett; modellerna |
+| `tree.cpp` | `load_tree()` och noderna: trädet expanderat i preorder, helt eller som skelett; modellerna på alla nivåer, och modellen för en nod eller ett fragment |
 | `elements_api.cpp` | vyerna, rutnäten, typsnitten, scenens material, bakgrunden, ljusen, filens identitet och loggen genom `Document`; `camera_forward()`, `clip_plane_count()` |
-| `property_reader.cpp` | `PropertyReader`: en nods flikar och egenskaper, ur minnet eller ur filen |
+| `property_reader.cpp` | `PropertyReader`: en nods flikar och egenskaper, ur minnet eller ur filen, med taket för läsarens cache |
 
 Biblioteket startar inga trådar och har inga lås. Vad som får göras samtidigt
 står vid `Document` i `HNwd.h`: const-anropen från flera trådar, en
@@ -141,10 +141,12 @@ andra trådar läser, eftersom trädet byggs vid sidan av och publiceras färdig
   skriver geometrin som OBJ med material och bilder, i världskoordinater, en
   grupp per objekt. `nwdcheck <fil> --poses` prövar varje fragments pose mot
   trädets transformer (`pose_check.h`).
-  `nwdsynth <ut.nwd> --fragments N --records M --nodes K [--no-spatial] [--unit k] [--seed S] [--sizes A:B] [--detail N]`
+  `nwdsynth <ut.nwd> --fragments N --records M --nodes K [--no-spatial] [--unit k] [--seed S] [--sizes A:B] [--detail N] [--prop-streams K] [--shared-tabs M] [--common-tab] [--instances N]`
   skriver en giltig syntetisk fil av valfri storlek, för prov i stor skala
   (`synth_writer.h`); `--sizes` sprider posternas storlek mellan A och B
-  meter och `--detail` är flest segment per post. Ett nytt
+  meter och `--detail` är flest segment per post. `--prop-streams` delar
+  egenskaperna på flera strömmar, `--shared-tabs` och `--common-tab` låter
+  löv dela flikar, och `--instances` sätter delträd på flera ställen. Ett nytt
   verktyg läggs till med `hnwd_tool()` i `tools/CMakeLists.txt` och skriver
   `tool_run()` i stället för `main()` ([tools/tool_main.h](tools/tool_main.h)).
 - `viewer/` — visaren `nwdview`, ett fönster byggt på GlazeUI med bara det
@@ -187,6 +189,10 @@ andra trådar läser, eftersom trädet byggs vid sidan av och publiceras färdig
   bilden; med `--profile` skriver de bildtiden, var i bilden tiden går och
   UI-trådens stopp. `--tile N` är största bit i trianglar, `--max-draws` och
   `--max-triangles` ritningens tak, och `--no-lines` stänger av linjerna.
+  `--pacing vsync|all|N` är bildtakten: `all` ritar varje bild hel
+  (förvalet); med `vsync` eller N bilder per sekund ritar ritytan det som
+  ryms i tiden medan kameran rör sig och fyller på resten i stillhet. En
+  bild som sparas utan rörelse ritas alltid hel.
   `nwdview --decode-jpeg <in.jpg> <ut.png>` prövar JPEG-avkodaren utan
   fönster. Regeln om inga beroenden gäller
   biblioteket, inte visaren.

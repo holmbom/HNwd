@@ -5,7 +5,7 @@
 A C++20 library for reading Navisworks files (`.nwd`, `.nwc`) without
 Navisworks, with no dependencies. One public header, `include/HNwd.h`.
 
-**Status: early development, version 0.1.0.** [TODO.md](TODO.md)
+**Status: early development, version 0.2.0.** [TODO.md](TODO.md)
 says what is left.
 
 ## What it reads
@@ -19,7 +19,8 @@ says what is left.
 - **The object tree** with names, tabs and properties: all of it in memory, or
   as a skeleton whose properties are read per node when they are needed
   (`TreeContent::Structure` with `PropertyReader`).
-- **The models** in a file with several, with source, loader and length unit.
+- **The models** in a file with several, also models inside models, with
+  source, loader and length unit, and the model a node or a fragment belongs to.
 - **A spatial tree** over the fragments, with a world box and a primitive
   count per node, for choosing what to load by level of detail: the file's
   own, or one HNwd builds.

@@ -84,9 +84,13 @@ std::string_view material_of(const TreeData& t, uint32_t index) {
 // delträd. En lagrad nod som sitter på flera ställen får en förekomst per
 // ställe. Explicit stack, ingen rekursion.
 //
+// `repeated` är nullptr eller får en bit per lagrad nod, sann om noden har mer
+// än en förekomst. `partitions` får antalet förekomster av klass 32.
+//
 // Ger false och en text om antalet inte blir det parsern räknade, eller om en
 // länk pekar utanför sin lista.
-bool expand(const detail::Hierarchy& h, Occurrences& out, std::string& why) {
+bool expand(const detail::Hierarchy& h, Occurrences& out, std::vector<bool>* repeated,
+            uint64_t& partitions, std::string& why) {
     struct Frame {
         const uint32_t* next;   // nästa barn att lägga till
         const uint32_t* end;
@@ -96,6 +100,15 @@ bool expand(const detail::Hierarchy& h, Occurrences& out, std::string& why) {
     out = Occurrences();
     out.reserve(static_cast<size_t>(h.expanded_total));
     out.push(kNone, kNone);   // roten
+    partitions = 0;
+
+    // Hjälpbiten: sann när en lagrad nod redan har fått en förekomst. Släpps
+    // när expansionen är klar.
+    std::vector<bool> seen;
+    if (repeated) {
+        repeated->assign(h.nodes.size(), false);
+        seen.assign(h.nodes.size(), false);
+    }
 
     std::vector<Frame> stack;
     stack.push_back({h.top.data(), h.top.data() + h.top.size(), 0});
@@ -121,6 +134,13 @@ bool expand(const detail::Hierarchy& h, Occurrences& out, std::string& why) {
         out.push(stored, parent);
 
         const detail::StoredNode& n = h.nodes[stored];
+        if (n.cls == 32) ++partitions;
+        if (repeated) {
+            if (seen[stored])
+                (*repeated)[stored] = true;
+            else
+                seen[stored] = true;
+        }
         const uint32_t count = h.child_count(stored);
         if (count == 0) continue;
         if (n.child_begin > h.children.size() || count > h.children.size() - n.child_begin) {
@@ -139,19 +159,46 @@ bool expand(const detail::Hierarchy& h, Occurrences& out, std::string& why) {
         return false;
     }
     out.finish();
+    if (repeated) repeated->shrink_to_fit();
     return true;
 }
 
-// Modellerna: toppnoderna av klass 32 i trädets ordning. Har trädet ingen
-// sådan och `own` inte är nullptr blir filens egen partition en modell med
-// roten som nod. Ger false och en text om en nod av klass 32 saknar sin svans.
-bool find_models(TreeData& t, std::string& why) {
+// Modellerna: alla förekomster av klass 32 i preorder, en modell före dem som
+// sitter i den, med närmaste omslutande modell och antalet omslutande. Klass 32
+// står bara som toppnod eller som barn till klass 32, så sökningen går bara
+// ner genom noder av den klassen. `partition_nodes` är antalet förekomster av
+// klass 32 i trädet. Har trädet ingen sådan och `has_own_partition` är sann
+// blir filens egen partition en modell med roten som nod. Ger false och en
+// text om en nod av klass 32 saknar sin svans, eller om antalet modeller inte
+// är antalet noder av klass 32.
+bool find_models(TreeData& t, uint64_t partition_nodes, std::string& why) {
+    struct Frame {
+        uint32_t next;     // nästa syskon att pröva
+        uint32_t end;      // delträdets slut
+        uint32_t parent;   // omslutande modell: index i models, eller kNone
+        uint32_t depth;    // antalet omslutande modeller
+    };
+
     const detail::Hierarchy& h = t.hierarchy;
     t.models.clear();
-    for (uint32_t i = 1; i < t.occurrences.size(); i += subtree_of(t, i)) {
+    const uint32_t total = static_cast<uint32_t>(t.occurrences.size());
+    std::vector<Frame> stack;
+    stack.push_back({1, total, kNone, 0});   // toppnoderna
+    while (!stack.empty()) {
+        Frame& frame = stack.back();
+        if (frame.next >= frame.end) {
+            stack.pop_back();
+            continue;
+        }
+        const uint32_t i = frame.next;
+        const uint32_t size = subtree_of(t, i);
+        frame.next += size;
+        const uint32_t enclosing = frame.parent;
+        const uint32_t depth = frame.depth;   // `frame` gäller inte efter push_back
+
         const detail::StoredNode* n = stored_of(t, i);
         if (!n) {
-            why = "LcOpNwdLogicalHierarchy: internal error: top node " + std::to_string(i) +
+            why = "LcOpNwdLogicalHierarchy: internal error: node " + std::to_string(i) +
                   " has no stored node";
             return false;
         }
@@ -169,7 +216,17 @@ bool find_models(TreeData& t, std::string& why) {
         m.source = tail.source_path;
         m.loader = tail.loader;
         m.unit_code = tail.unit_code;
+        m.parent = enclosing;
+        m.depth = depth;
+        const uint32_t index = static_cast<uint32_t>(t.models.size());
         t.models.push_back(m);
+        if (size > 1) stack.push_back({i + 1, i + size, index, depth + 1});
+    }
+    if (t.models.size() != partition_nodes) {
+        why = "LcOpNwdLogicalHierarchy: internal error: the tree has " +
+              std::to_string(partition_nodes) + " class 32 nodes but " +
+              std::to_string(t.models.size()) + " models were found";
+        return false;
     }
     if (t.models.empty() && t.has_own_partition) {
         const detail::Partition& p = t.own_partition;
@@ -268,6 +325,26 @@ const TreeData* tree_of(const ImplPtr& impl) {
     return impl ? impl->tree_view.load() : nullptr;
 }
 
+// Den innersta modellen vars delträd har förekomsten `node` (index i
+// t.models), eller kNone. Modellernas noder växer med indexet: den sista med
+// node <= `node` är den som börjar närmast före, och har den inte noden
+// ligger noden i en av dess föräldrar eller i ingen.
+uint32_t model_containing(const TreeData& t, uint32_t node) {
+    const std::vector<ModelEntry>& models = t.models;
+    if (node >= t.occurrences.size()) return kNone;
+    const auto it = std::upper_bound(models.begin(), models.end(), node,
+                                     [](uint32_t n, const ModelEntry& m) { return n < m.node; });
+    if (it == models.begin()) return kNone;
+    uint32_t i = static_cast<uint32_t>(it - models.begin()) - 1;
+    while (i != kNone) {
+        const ModelEntry& m = models[i];
+        if (static_cast<uint64_t>(node) < static_cast<uint64_t>(m.node) + subtree_of(t, m.node))
+            return i;
+        i = m.parent;
+    }
+    return kNone;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -330,7 +407,7 @@ size_t TreeData::memory_bytes() const {
     size_t n = sizeof(TreeData) + hierarchy.memory_bytes() +
                occurrences.memory_bytes() +
                streams.props.capacity() * sizeof(detail::StreamSpan) + skeleton.memory_bytes() +
-               models.capacity() * sizeof(ModelEntry);
+               models.capacity() * sizeof(ModelEntry) + (repeated.capacity() + 7) / 8;
     if (has_own_partition) {
         const detail::Partition& p = own_partition;
         n += p.name.capacity() + p.user_display.capacity() + p.user_internal.capacity() +
@@ -396,9 +473,12 @@ Status Document::load_tree(TreeContent content, const Progress& progress) try {
                           std::to_string(hierarchy.expanded_total) +
                           " nodes, more than a node index can address");
 
+    uint64_t partition_nodes = 0;
     {
         std::string why;
-        if (!expand(hierarchy, tree->occurrences, why)) return s.fail(Status::Corrupt, why.c_str());
+        if (!expand(hierarchy, tree->occurrences, structure ? &tree->repeated : nullptr,
+                    partition_nodes, why))
+            return s.fail(Status::Corrupt, why.c_str());
     }
 
     // Utan partitioner i trädet är filens egen partition den enda modellen.
@@ -417,7 +497,7 @@ Status Document::load_tree(TreeContent content, const Progress& progress) try {
     }
     {
         std::string why;
-        if (!find_models(*tree, why)) return s.fail(Status::Corrupt, why.c_str());
+        if (!find_models(*tree, partition_nodes, why)) return s.fail(Status::Corrupt, why.c_str());
     }
 
     // Är fragmenten redan lästa är det trädet som kommer sist. Går det inte
@@ -506,6 +586,21 @@ uint32_t Document::parent(uint32_t index) const {
     return t->occurrences.parent(index);
 }
 
+uint32_t Document::model_of_node(uint32_t node) const {
+    const TreeData* t = tree_of(impl_);
+    if (!t || !impl_->fragments) return kNone;
+    return model_containing(*t, node);
+}
+
+uint32_t Document::model_of_fragment(size_t fragment) const {
+    const TreeData* t = tree_of(impl_);
+    if (!t || !impl_->fragments || fragment >= impl_->fragments->size()) return kNone;
+    // load_fragments() och load_tree() har prövat att seq är ett löv i trädet.
+    const int64_t seq = impl_->fragments->items[fragment].seq;
+    if (seq < 0 || seq >= static_cast<int64_t>(t->occurrences.size())) return kNone;
+    return model_containing(*t, static_cast<uint32_t>(seq));
+}
+
 uint32_t Document::node_of_fragment(size_t fragment) const {
     const TreeData* t = tree_of(impl_);
     if (!t || !impl_->fragments || fragment >= impl_->fragments->size()) return kNone;
@@ -581,6 +676,8 @@ bool Document::model(size_t i, Model& out) const {
     result.node = m.node;
     result.first_fragment = static_cast<uint32_t>(first_index);
     result.fragment_count = static_cast<uint32_t>(count);
+    result.parent = m.parent;
+    result.depth = m.depth;
     out = result;
     return true;
 }

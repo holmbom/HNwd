@@ -3,6 +3,7 @@
 //   nwdview [fil] [--png bild.png] [--view namn] [--budget MB] [--gpu-budget MB]
 //           [--pick-cache MB] [--tile N] [--min-pixels N] [--max-draws N] [--max-triangles M]
 //           [--size-margin F] [--no-lines] [--tour] [--spin varv] [--profile]
+//           [--pacing vsync|all|N]
 //           [--gpu integrated|discrete] [--uv raw|realworld]
 //           [--eye x y z --look x y z] [--walk-mode] [--follow] [--walk meter]
 //           [--speed m/s] [--clip on|off] [--clip-test "px py pz nx ny nz"]...
@@ -284,6 +285,22 @@ int main(int argc, char** argv) {
                 return 2;
             }
             options.governor.max_triangles = static_cast<uint64_t>(m * 1e6);
+        } else if (a == "--pacing" && has_value) {
+            // all (varje bild hel, förvalet), vsync eller bilder per sekund.
+            const std::string v = args[++i];
+            if (v == "vsync") {
+                options.pacing_fps = 0;
+            } else if (v == "all") {
+                options.pacing_fps = -1;
+            } else {
+                char* end = nullptr;
+                const double fps = std::strtod(v.c_str(), &end);
+                if (end == v.c_str() || *end != '\0' || !(fps > 0)) {
+                    std::fprintf(stderr, "nwdview: --pacing tar vsync, all eller bilder per sekund\n");
+                    return 2;
+                }
+                options.pacing_fps = fps;
+            }
         } else if (a == "--profile") {
             options.profile = true;
         } else if (a == "--tour") {

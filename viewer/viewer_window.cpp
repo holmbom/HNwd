@@ -1725,6 +1725,19 @@ ViewerWindow::ViewerWindow(ViewerOptions options)
     // Filens kamera kan se rakt nedåt; orbiten får nå dit.
     scene_.setElevationRange(-90, 90);
     scene_.setMemoryBudget(kCanvasImageBudget);
+    // Bildtakten: ritytan ritar det som ryms i tiden medan kameran rör sig
+    // och fyller på resten när den står still. En bild som ska sparas utan
+    // rörelse ritas hel.
+    const bool whole_image = !options_.png.empty() && options_.walk_distance <= 0 &&
+                             options_.spin <= 0 && !options_.tour;
+    if (whole_image || options_.pacing_fps < 0) {
+        scene_.setFramePacing(glaze::FramePacing::DrawAll);
+    } else if (options_.pacing_fps > 0) {
+        scene_.setFrameRate(options_.pacing_fps);
+        scene_.setFramePacing(glaze::FramePacing::Fps);
+    } else {
+        scene_.setFramePacing(glaze::FramePacing::VSync);
+    }
     light_.ambient = 0.5f;
     light_.diffuse = 0.6f;
     // Motljuset: det som vänder sig bort från ljuset lyses upp lite.
